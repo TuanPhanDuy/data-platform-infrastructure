@@ -1,0 +1,32 @@
+# Promtail: tails the services' JSON log files and pushes them to Loki.
+# Local apps run on the host with stdout redirected into ./logs/<service>.log
+# (see README); that directory is bind-mounted to /var/log/data-platform.
+# In Kubernetes, run Promtail/Grafana Alloy as a DaemonSet against pod stdout
+# instead — the JSON format and traceId field are identical.
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: data-platform
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: data-platform
+          __path__: /var/log/data-platform/*.log
+    pipeline_stages:
+      # Parse the JSON line so we can label by service/level; the raw line is
+      # kept intact so Grafana's derived field can pull traceId out of it.
+      - json:
+          expressions:
+            service: service
+            level: level
+      - labels:
+          service:
+          level:

@@ -1,0 +1,72 @@
+{{- if eq .Values.gateway.provider "kong" }}
+{{- $rel := .Release.Name -}}
+{{- $ui := "data-platform-ui" -}}
+{{- /* Plugins applied to authenticated API routes. */ -}}
+{{- $authPlugins := list (printf "%s-iam-authz" $rel) (printf "%s-cors" $rel) (printf "%s-correlation-id" $rel) -}}
+{{- if and .Values.gateway.jwt.enabled .Values.gateway.jwt.rsaPublicKey }}{{ $authPlugins = prepend $authPlugins (printf "%s-jwt-auth" $rel) }}{{ end -}}
+{{- range .Values.gateway.routes }}
+{{- $route := . }}
+{{- $svc := index $.Values.services $route.service }}
+{{- if $svc.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $rel }}-gw-{{ $route.service }}
+  labels:
+    {{- include "dp.commonLabels" $ | nindent 4 }}
+  annotations:
+    konghq.com/plugins: {{ join "," $authPlugins | quote }}
+    konghq.com/strip-path: "false"
+spec:
+  ingressClassName: {{ $.Values.gateway.ingressClass }}
+  {{- with $.Values.gateway.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ $.Values.gateway.host | quote }}
+      http:
+        paths:
+          {{- range $route.paths }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "dp.resourceName" (dict "root" $ "name" $route.service) }}
+                port:
+                  number: {{ $svc.port }}
+          {{- end }}
+{{- end }}
+{{- end }}
+{{- /* Public SPA — no auth, just CORS + correlation id. */ -}}
+{{- if (index .Values.services $ui).enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $rel }}-gw-ui
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+  annotations:
+    konghq.com/plugins: {{ printf "%s-cors,%s-correlation-id" $rel $rel | quote }}
+    konghq.com/strip-path: "false"
+spec:
+  ingressClassName: {{ .Values.gateway.ingressClass }}
+  {{- with .Values.gateway.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.gateway.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "dp.resourceName" (dict "root" $ "name" $ui) }}
+                port:
+                  number: {{ (index .Values.services $ui).port }}
+{{- end }}
+{{- end }}

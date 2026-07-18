@@ -1,0 +1,17 @@
+apiVersion: v2
+name: data-platform
+description: |
+  Helm chart for the semantic data platform: semantic-service, chat-service,
+  iam-service, the data-platform-ui SPA, and Cube.dev itself (model baked in
+  per-commit by cube-semantic-demo's CI — this chart is what ArgoCD syncs).
+  Stateful backing services (Postgres, Redis, StarRocks, Keycloak) stay
+  external by default; opt-in in-cluster Postgres/Redis are provided for dev.
+type: application
+version: 0.2.0
+appVersion: "1.0.0"
+keywords:
+  - data-platform
+  - cube
+  - semantic-layer
+maintainers:
+  - name: data-platform team

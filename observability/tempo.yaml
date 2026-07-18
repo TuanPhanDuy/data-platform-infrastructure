@@ -1,0 +1,21 @@
+# Tempo: trace storage. Receives spans from the OTel Collector over OTLP,
+# stores them locally (fine for dev), and serves them to Grafana on :3200.
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal

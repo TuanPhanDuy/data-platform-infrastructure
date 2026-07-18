@@ -1,0 +1,342 @@
+# Default values for the data-platform chart.
+# These defaults are production-leaning: autoscaling on, in-cluster backing
+# infra OFF (point at managed/external services). See values-dev.yaml for a
+# self-contained local stack and values-prod.yaml for a hardened example.
+
+global:
+  # Prefixed onto every image repository, e.g. "registry.example.com/".
+  imageRegistry: ""
+  imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  # Leave empty to use "<release>-sa".
+  name: ""
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Release-aware, shared configuration surfaced to every service as env vars
+# (via the ConfigMap). Cross-service URLs (e.g. the semantic-service address a
+# chat pod calls) are derived from the release name in the template, so they
+# are NOT listed here. Override the external endpoints below per environment.
+# ---------------------------------------------------------------------------
+config:
+  # "json" activates structured JSON logging (logback-spring.xml) for Loki.
+  springProfilesActive: "prod,json"
+  # Cube.dev — semantic-service's upstream. Ignored (auto-rewritten to the in-cluster
+  # Service) when services.cube.enabled=true; only used when Cube is external (Cube
+  # Cloud, or cube-semantic-demo's docker-compose during local dev).
+  cubeApiUrl: "http://cube:4000/cubejs-api/v1"
+  cubeSqlUrl: "jdbc:postgresql://cube:15432/cube"
+  cubeSqlUser: "cube"
+  # Cube.dev's OWN connection to StarRocks — only read by the `cube` pod itself
+  # (services.cube.enabled=true). StarRocks/Postgres are never bundled; point these
+  # at wherever StarRocks actually runs (cube-semantic-demo's docker-compose in dev).
+  cubeDbType: "mysql"
+  cubeDbHost: "starrocks"
+  cubeDbPort: "9030"
+  cubeDbUser: "root"
+  cubeDbName: "information_schema"
+  cubeDevMode: "true"
+  # Redis — overridden automatically when infra.redis.enabled=true.
+  redisHost: "redis"
+  redisPort: "6379"
+  chatMemory: "redis"
+  # iam-service datasource — overridden when infra.postgresql.enabled=true.
+  iamDbUrl: "jdbc:postgresql://iam-postgres:5432/iam"
+  # Keycloak — external by default.
+  keycloakServerUrl: "http://keycloak:8080"
+  keycloakIssuerUri: "http://keycloak:8080/realms/data-platform"
+  keycloakRealm: "data-platform"
+
+# Secret consumed by the backend services (Cube API secret, SQL/DB passwords,
+# Keycloak admin secret). In prod set create=false and pre-provision a Secret
+# named `name` out of band (sealed-secrets / external-secrets / vault).
+appSecret:
+  create: true
+  name: ""            # empty -> "<release>-secret"
+  data:
+    CUBE_API_SECRET: "demo-secret-change-me-please-32bytes-min"
+    CUBE_SQL_PASSWORD: "demo-secret-change-me"
+    DB_PASSWORD: "iam"
+    KEYCLOAK_ADMIN_CLIENT_SECRET: "iam-service-secret"
+
+# ---------------------------------------------------------------------------
+# Stateless application services. Structurally identical, rendered by a range
+# in templates/deployment.yaml / service.yaml / hpa.yaml / pdb.yaml.
+# ---------------------------------------------------------------------------
+services:
+  semantic-service:
+    enabled: true
+    image:
+      repository: data-platform/semantic-service
+      tag: ""                    # empty -> Chart.appVersion
+      pullPolicy: IfNotPresent
+    port: 8081
+    replicas: 2                  # used only when autoscaling.enabled=false
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+      targetMemoryUtilizationPercentage: 80
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits:   { cpu: "1",  memory: 1Gi }
+    probes:
+      type: http                 # actuator present
+      path: /actuator/health
+      initialDelaySeconds: 30
+    metrics:
+      enabled: true
+      path: /actuator/prometheus
+    pdb:
+      enabled: true
+      minAvailable: 1
+    env: {}
+
+  chat-service:
+    enabled: true
+    image:
+      repository: data-platform/chat-service
+      tag: ""
+      pullPolicy: IfNotPresent
+    port: 8082
+    replicas: 2
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 8             # chat is the hottest path
+      targetCPUUtilizationPercentage: 65
+      targetMemoryUtilizationPercentage: 80
+    resources:
+      requests: { cpu: 300m, memory: 512Mi }
+      limits:   { cpu: "1",  memory: 1Gi }
+    probes:
+      type: http                 # actuator added for observability
+      path: /actuator/health
+      initialDelaySeconds: 30
+    metrics:
+      enabled: true
+      path: /actuator/prometheus
+    pdb:
+      enabled: true
+      minAvailable: 1
+    env: {}
+
+  iam-service:
+    enabled: true
+    image:
+      repository: data-platform/iam-service
+      tag: ""
+      pullPolicy: IfNotPresent
+    port: 8084
+    replicas: 2
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+      targetMemoryUtilizationPercentage: 80
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits:   { cpu: "1",  memory: 1Gi }
+    probes:
+      type: http                 # actuator health probes enabled in app config
+      livenessPath: /actuator/health/liveness
+      readinessPath: /actuator/health/readiness
+      initialDelaySeconds: 30
+    metrics:
+      enabled: true
+      path: /actuator/prometheus
+    pdb:
+      enabled: true
+      minAvailable: 1
+    env: {}
+
+  data-platform-ui:
+    enabled: true
+    image:
+      repository: data-platform/data-platform-ui
+      tag: ""
+      pullPolicy: IfNotPresent
+    port: 8080                   # unprivileged nginx
+    replicas: 2
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      targetCPUUtilizationPercentage: 80
+    resources:
+      requests: { cpu: 50m,  memory: 64Mi }
+      limits:   { cpu: 250m, memory: 128Mi }
+    probes:
+      type: http
+      path: /healthz
+      initialDelaySeconds: 5
+    pdb:
+      enabled: true
+      minAvailable: 1
+    env: {}
+
+  # The Cube.dev semantic layer itself. Image is built + pushed by cube-semantic-demo's
+  # model-ci.yml with the YAML model baked in (immutable per-commit image, not a bind mount) —
+  # bumping .image.tag here IS the GitOps deploy; see docs/HLD.md. Single-instance (Cube dev-mode
+  # keeps its pre-aggregation cache in Cube Store, not locally, so this is safe but not
+  # horizontally scaled today). StarRocks/Postgres stay external (config.cubeDb*).
+  cube:
+    enabled: true
+    image:
+      repository: ghcr.io/tuanphanduy/cube-semantic
+      tag: ""                    # empty -> Chart.appVersion; CI bumps this to the git sha
+      pullPolicy: IfNotPresent
+    port: 4000                   # REST + GraphQL API + Playground
+    extraPorts:
+      - name: sql                # Cube SQL API (Postgres wire protocol) — semantic-service's /sql-rewrite
+        port: 15432
+    replicas: 1                  # used only when autoscaling.enabled=false
+    autoscaling:
+      enabled: false
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits:   { cpu: "1",  memory: 1Gi }
+    probes:
+      type: http
+      path: /readyz
+      initialDelaySeconds: 20
+    pdb:
+      enabled: false
+    # The upstream cubejs/cube image has no non-root user configured (runs as root, uid 0) —
+    # unlike our own services' images, which do. Confirmed via `docker inspect`/`docker run id`.
+    securityContext:
+      runAsNonRoot: false
+    # Cube.dev expects CUBEJS_API_SECRET; appSecret stores it as CUBE_API_SECRET (the name
+    # semantic-service's own config uses) — envFrom.secretRef can't rename keys, so map it here.
+    envSecret:
+      CUBEJS_API_SECRET: CUBE_API_SECRET
+    env: {}
+
+# ---------------------------------------------------------------------------
+# Ingress. Single host; the UI at "/" and each backend under an /api/* prefix
+# that is stripped before forwarding (nginx-ingress rewrite). Build the UI with
+# VITE_SEMANTIC_API=/api/semantic etc. so the browser calls match these paths.
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  host: data-platform.local
+  # Extra annotations added to BOTH ingresses (e.g. cert-manager, auth). The
+  # prefix-stripping rewrite is applied automatically to the API ingress only.
+  annotations: {}
+  tls: []                        # e.g. [{ secretName: dp-tls, hosts: [data-platform.local] }]
+  # path -> service. `ui` catches everything else at "/".
+  apiRoutes:
+    - pathPrefix: /api/semantic
+      service: semantic-service
+    - pathPrefix: /api/chat
+      service: chat-service
+    - pathPrefix: /api/iam
+      service: iam-service
+
+# ---------------------------------------------------------------------------
+# Optional in-cluster backing infra — DEV CONVENIENCE ONLY, not production
+# grade. Best practice: keep these OFF in prod and use managed Postgres,
+# managed Redis, Cube Cloud, and a Keycloak operator / managed IdP. StarRocks
+# (and Postgres, the system of record it federates) are intentionally NOT
+# bundled — run them via cube-semantic-demo's docker-compose, or a dedicated
+# operator, and set config.cubeDb* to reach them. Cube.dev ITSELF is bundled
+# (services.cube above) since its model is what this repo's GitOps loop syncs.
+# ---------------------------------------------------------------------------
+infra:
+  redis:
+    enabled: false
+    image: redis:7-alpine
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits:   { cpu: 250m, memory: 256Mi }
+    persistence:
+      enabled: false
+      size: 1Gi
+  postgresql:
+    enabled: false
+    image: postgres:16-alpine
+    database: iam
+    username: iam
+    # password is taken from appSecret.data.DB_PASSWORD
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 512Mi }
+    persistence:
+      enabled: true
+      size: 5Gi
+      storageClass: ""
+
+# ---------------------------------------------------------------------------
+# Observability. Every service exposes Prometheus metrics and exports OTLP
+# traces; logs go to stdout as JSON (traceId/spanId) for a Loki agent.
+#   - prometheusAnnotations: annotate pods for a scrape-annotation Prometheus.
+#   - serviceMonitor:        emit ServiceMonitors for the Prometheus Operator
+#                            (kube-prometheus-stack) instead — pick one.
+#   - collector:             deploy a small in-cluster OTel Collector. When on,
+#                            OTLP_TRACING_ENDPOINT auto-points at it; otherwise
+#                            set observability.otlpEndpoint to an external one.
+# The Grafana/Tempo/Loki/Prometheus backends themselves are expected from
+# kube-prometheus-stack + Grafana Tempo/Loki (or Grafana Cloud) — see README.
+# ---------------------------------------------------------------------------
+observability:
+  enabled: true
+  tracingSampleRate: "0.1"
+  environment: "prod"
+  # Used when collector.enabled=false. Full OTLP HTTP traces URL.
+  otlpEndpoint: "http://otel-collector:4318/v1/traces"
+  prometheusAnnotations:
+    enabled: true
+  serviceMonitor:
+    enabled: false
+    # Extra labels so the Prometheus Operator selects these (e.g. release: kube-prometheus-stack).
+    labels: {}
+    interval: 15s
+  collector:
+    enabled: false
+    image: otel/opentelemetry-collector-contrib:0.119.0
+    # Where the collector forwards traces (e.g. an in-cluster Tempo).
+    tempoEndpoint: "tempo:4317"
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 512Mi }
+
+# ---------------------------------------------------------------------------
+# API gateway. provider=kong fronts all services with Kong (via the Kong
+# Ingress Controller): JWT authentication at the edge + authorization delegated
+# to iam-service (GET /api/v1/me → trusted X-Tenant-Id/X-Roles/... headers).
+# provider=nginx falls back to the plain nginx Ingress defined in ingress.yaml.
+#
+# Requires the Kong Ingress Controller installed separately (Helm: kong/ingress),
+# with the serverless-function sandbox allowed to require the authz Lua modules:
+#   proxy env:  untrusted_lua=sandbox
+#               untrusted_lua_sandbox_requires=resty.http,cjson.safe
+# ---------------------------------------------------------------------------
+gateway:
+  provider: kong               # kong | nginx
+  ingressClass: kong
+  host: data-platform.local
+  tls: []
+  # Native-path routing (the SPA calls services on their own paths — no rewrite).
+  routes:
+    - service: semantic-service
+      paths: [/api/cubes, /api/model, /api/metrics]
+    - service: chat-service
+      paths: [/api/chat, /api/sql]
+    - service: iam-service
+      paths: [/api/v1]
+  jwt:
+    enabled: true
+    # PEM public key of the Keycloak realm (RS256). Fetch the body from
+    # GET {keycloak}/realms/{realm} .public_key and wrap in PEM headers.
+    # When empty, JWT edge-auth is skipped and iam-service alone enforces auth.
+    rsaPublicKey: ""
+  authz:
+    # iam-service endpoint the authz function calls is derived from the release.
+    cacheTtlSeconds: 30
+  cors:
+    origins: ["*"]

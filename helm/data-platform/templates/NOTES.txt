@@ -1,0 +1,27 @@
+
+{{ .Chart.Name }} {{ .Chart.AppVersion }} deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Services (ClusterIP):
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+  - {{ include "dp.resourceName" (dict "root" $ "name" $name) }}:{{ $svc.port }}{{ if $svc.autoscaling.enabled }}  [HPA {{ $svc.autoscaling.minReplicas }}-{{ $svc.autoscaling.maxReplicas }}]{{ else }}  [{{ $svc.replicas }} replicas]{{ end }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+
+UI:   http://{{ .Values.ingress.host }}/
+API:  http://{{ .Values.ingress.host }}/api/semantic , /api/chat , /api/iam
+(add "{{ .Values.ingress.host }}" to /etc/hosts pointing at your ingress controller IP)
+{{- end }}
+
+Watch autoscaling:
+  kubectl get hpa -n {{ .Release.Namespace }} -w
+Check rollout:
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/part-of=data-platform
+
+{{- if not (or .Values.infra.redis.enabled .Values.infra.postgresql.enabled) }}
+
+NOTE: in-cluster infra is OFF. Ensure config.redisHost / config.iamDbUrl / config.cube*
+point at reachable external services, and that appSecret holds the real credentials.
+{{- end }}

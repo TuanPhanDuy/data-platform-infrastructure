@@ -1,0 +1,82 @@
+{{- if and .Values.ingress.enabled (ne .Values.gateway.provider "kong") }}
+{{- $ui := "data-platform-ui" -}}
+{{- /*
+Two Ingress objects on the same host: the API ingress carries the
+rewrite-target annotation that strips the /api/<svc> prefix, while the UI
+ingress serves the SPA at "/" without any rewrite. Keeping them separate
+avoids the classic nginx-ingress footgun of a single rewrite annotation
+leaking onto the catch-all path.
+*/ -}}
+{{- $anyApi := false -}}
+{{- range .Values.ingress.apiRoutes }}{{- if (index $.Values.services .service).enabled }}{{- $anyApi = true }}{{- end }}{{- end }}
+{{- if $anyApi }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-api-ingress
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          {{- range .Values.ingress.apiRoutes }}
+          {{- $svc := index $.Values.services .service }}
+          {{- if $svc.enabled }}
+          - path: {{ printf "%s(/|$)(.*)" .pathPrefix }}
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ include "dp.resourceName" (dict "root" $ "name" .service) }}
+                port:
+                  number: {{ $svc.port }}
+          {{- end }}
+          {{- end }}
+{{- end }}
+{{- if (index .Values.services $ui).enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-ui-ingress
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "dp.resourceName" (dict "root" $ "name" $ui) }}
+                port:
+                  number: {{ (index .Values.services $ui).port }}
+{{- end }}
+{{- end }}

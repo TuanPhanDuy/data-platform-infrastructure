@@ -1,0 +1,87 @@
+# Prod overlay: external managed backing services, secret provisioned out of
+# band, higher autoscaling ceilings and pinned images from a private registry.
+#
+# helm upgrade --install dp ./deploy/helm/data-platform -n data-platform -f values-prod.yaml
+
+global:
+  imageRegistry: "registry.example.com/"     # trailing slash required
+  imagePullSecrets:
+    - name: registry-creds
+
+observability:
+  environment: "prod"
+  tracingSampleRate: "0.05"    # sample 5% under production load
+  # Prefer the Prometheus Operator over scrape annotations in prod.
+  prometheusAnnotations:
+    enabled: false
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
+  collector:
+    enabled: true
+    tempoEndpoint: "tempo-distributor.observability.svc:4317"
+
+config:
+  springProfilesActive: "prod,json"
+  # This example targets Cube CLOUD (external) — hence services.cube.enabled: false below.
+  # For self-hosted Cube-in-this-cluster instead, drop these two and leave services.cube on;
+  # the chart auto-points semantic-service at the in-cluster Service either way.
+  cubeApiUrl: "https://your-deployment.cubecloud.dev/cubejs-api/v1"
+  cubeSqlUrl: "jdbc:postgresql://your-deployment.cubecloud.dev:5432/cube"
+  redisHost: "redis.prod.internal"           # managed Redis / ElastiCache
+  iamDbUrl: "jdbc:postgresql://iam-db.prod.internal:5432/iam"   # managed Postgres
+  keycloakServerUrl: "https://sso.example.com"
+  keycloakIssuerUri: "https://sso.example.com/realms/data-platform"
+
+# Do NOT ship secrets in git. Pre-create a Secret (sealed-secrets / external-
+# secrets / vault) and reference it here.
+appSecret:
+  create: false
+  name: "data-platform-secrets"
+
+# Keep all stateful infra external.
+infra:
+  redis:
+    enabled: false
+  postgresql:
+    enabled: false
+
+ingress:
+  host: data-platform.example.com
+  tls:
+    - secretName: data-platform-tls
+      hosts:
+        - data-platform.example.com
+
+gateway:
+  provider: kong
+  host: data-platform.example.com
+  tls:
+    - secretName: data-platform-tls
+      hosts:
+        - data-platform.example.com
+  jwt:
+    enabled: true
+    # Inject the realm's RS256 public key (PEM) via your secrets tooling, e.g.
+    #   --set-file gateway.jwt.rsaPublicKey=realm-pubkey.pem
+    rsaPublicKey: ""
+
+services:
+  semantic-service:
+    image: { tag: "1.0.0" }
+    autoscaling: { enabled: true, minReplicas: 3, maxReplicas: 10, targetCPUUtilizationPercentage: 70 }
+  chat-service:
+    image: { tag: "1.0.0" }
+    autoscaling: { enabled: true, minReplicas: 3, maxReplicas: 15, targetCPUUtilizationPercentage: 65 }
+  iam-service:
+    image: { tag: "1.0.0" }
+    autoscaling: { enabled: true, minReplicas: 3, maxReplicas: 8 }
+  data-platform-ui:
+    image: { tag: "1.0.0" }
+    autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6 }
+  cube:
+    enabled: false   # this example targets Cube Cloud (external) — see config.cubeApiUrl above
+  # No pinned tag here on purpose: cube-semantic-demo's model-ci.yml bumps
+  # services.cube.image.tag to the git SHA that introduced the last validated
+  # model change — ArgoCD syncing THAT commit is the actual deploy.

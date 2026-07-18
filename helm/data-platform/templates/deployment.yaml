@@ -1,0 +1,121 @@
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dp.resourceName" (dict "root" $ "name" $name) }}
+  labels:
+    {{- include "dp.commonLabels" $ | nindent 4 }}
+    {{- include "dp.selectorLabels" (dict "root" $ "name" $name) | nindent 4 }}
+spec:
+  {{- if not $svc.autoscaling.enabled }}
+  replicas: {{ $svc.replicas | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "dp.selectorLabels" (dict "root" $ "name" $name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dp.commonLabels" $ | nindent 8 }}
+        {{- include "dp.selectorLabels" (dict "root" $ "name" $name) | nindent 8 }}
+      annotations:
+        # Roll pods when shared config/secret change.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") $ | sha256sum }}
+        {{- if and $.Values.observability.prometheusAnnotations.enabled (dig "metrics" "enabled" false $svc) }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $svc.port | quote }}
+        prometheus.io/path: {{ dig "metrics" "path" "/actuator/prometheus" $svc | quote }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "dp.serviceAccountName" $ }}
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        # cubejs/cube's upstream image has no non-root user configured — override to false
+        # only for that service (services.cube.securityContext.runAsNonRoot: false).
+        runAsNonRoot: {{ dig "securityContext" "runAsNonRoot" true $svc }}
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread replicas across nodes so autoscaling actually improves resiliency.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "dp.selectorLabels" (dict "root" $ "name" $name) | nindent 14 }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "dp.image" (dict "root" $ "svc" $svc) }}
+          imagePullPolicy: {{ $svc.image.pullPolicy | default "IfNotPresent" }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.port }}
+            {{- range $svc.extraPorts }}
+            - name: {{ .name }}
+              containerPort: {{ .port }}
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ $.Release.Name }}-config
+            - secretRef:
+                name: {{ include "dp.secretName" $ }}
+                optional: true
+          {{- if or $svc.env $svc.envSecret }}
+          env:
+            {{- range $k, $v := $svc.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- /* Secret-sourced env vars, e.g. renaming appSecret's CUBE_API_SECRET key to the
+                   CUBEJS_API_SECRET name Cube.dev itself expects — envFrom.secretRef can't rename keys. */}}
+            {{- range $envName, $secretKey := $svc.envSecret }}
+            - name: {{ $envName }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dp.secretName" $ }}
+                  key: {{ $secretKey }}
+            {{- end }}
+          {{- end }}
+          {{- if eq ($svc.probes.type | default "http") "http" }}
+          livenessProbe:
+            httpGet:
+              path: {{ $svc.probes.livenessPath | default $svc.probes.path | default "/" }}
+              port: http
+            initialDelaySeconds: {{ $svc.probes.initialDelaySeconds | default 30 }}
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: {{ $svc.probes.readinessPath | default $svc.probes.path | default "/" }}
+              port: http
+            initialDelaySeconds: {{ div ($svc.probes.initialDelaySeconds | default 30) 2 }}
+            periodSeconds: 10
+            failureThreshold: 3
+          {{- else }}
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: {{ $svc.probes.initialDelaySeconds | default 30 }}
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: {{ div ($svc.probes.initialDelaySeconds | default 30) 2 }}
+            periodSeconds: 10
+            failureThreshold: 3
+          {{- end }}
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+{{- end }}
+{{- end }}

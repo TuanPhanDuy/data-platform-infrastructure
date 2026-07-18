@@ -1,0 +1,122 @@
+{{- if eq .Values.gateway.provider "kong" }}
+{{- $rel := .Release.Name -}}
+{{- $iamPort := (index .Values.services "iam-service").port -}}
+{{- /* Authorization: call iam-service /api/v1/me, inject trusted identity headers.
+       Mirrors gateway/authz.lua; the iam URL is rendered for this release. */ -}}
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: {{ $rel }}-iam-authz
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+plugin: post-function
+config:
+  access:
+    - |
+      local http = require "resty.http"
+      local cjson = require "cjson.safe"
+      local TRUSTED = { "X-Tenant-Id", "X-User-Id", "X-Roles", "X-Permissions" }
+      for _, h in ipairs(TRUSTED) do
+        kong.service.request.clear_header(h)
+      end
+      local auth = kong.request.get_header("Authorization")
+      if not auth or auth == "" then
+        return kong.response.exit(401, { message = "missing bearer token" })
+      end
+      local IAM_ME_URL = "http://{{ $rel }}-iam-service:{{ $iamPort }}/api/v1/me"
+      local cache_key = "iam-authz:" .. ngx.md5(auth)
+      local function resolve()
+        local httpc = http.new()
+        httpc:set_timeout(2000)
+        local res, err = httpc:request_uri(IAM_ME_URL, {
+          method = "GET",
+          headers = { ["Authorization"] = auth, ["Accept"] = "application/json" },
+        })
+        if not res then return nil, "iam-service unreachable: " .. (err or "unknown") end
+        return { status = res.status, body = res.body }
+      end
+      local ctx, err = kong.cache:get(cache_key, { ttl = {{ .Values.gateway.authz.cacheTtlSeconds }}, neg_ttl = 15 }, resolve)
+      if not ctx then
+        kong.log.err("iam-authz: ", err)
+        return kong.response.exit(503, { message = "authorization service unavailable" })
+      end
+      if ctx.status == 401 then
+        return kong.response.exit(401, { message = "invalid or expired token" })
+      elseif ctx.status ~= 200 then
+        return kong.response.exit(403, { message = "forbidden" })
+      end
+      local me = cjson.decode(ctx.body)
+      if not me or not me.tenantId then
+        return kong.response.exit(403, { message = "no tenant for caller" })
+      end
+      kong.service.request.set_header("X-Tenant-Id", me.tenantId)
+      kong.service.request.set_header("X-User-Id", me.subject or "")
+      kong.service.request.set_header("X-Roles", table.concat(me.roles or {}, ","))
+      kong.service.request.set_header("X-Permissions", table.concat(me.permissions or {}, ","))
+---
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: {{ $rel }}-cors
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+plugin: cors
+config:
+  origins:
+    {{- toYaml .Values.gateway.cors.origins | nindent 4 }}
+  methods: [GET, POST, PUT, DELETE, OPTIONS, PATCH]
+  headers: [Authorization, Content-Type, Accept, X-Correlation-Id]
+  credentials: false
+  preflight_continue: false
+---
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: {{ $rel }}-correlation-id
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+plugin: correlation-id
+config:
+  header_name: X-Correlation-Id
+  generator: uuid
+  echo_downstream: true
+{{- if and .Values.gateway.jwt.enabled .Values.gateway.jwt.rsaPublicKey }}
+---
+{{- /* Authentication: validate Keycloak-issued RS256 JWTs at the edge. */ -}}
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: {{ $rel }}-jwt-auth
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+plugin: jwt
+config:
+  claims_to_verify: [exp]
+  key_claim_name: iss
+---
+apiVersion: configuration.konghq.com/v1
+kind: KongConsumer
+metadata:
+  name: {{ $rel }}-keycloak
+  annotations:
+    kubernetes.io/ingress.class: {{ .Values.gateway.ingressClass }}
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+username: keycloak
+credentials:
+  - {{ $rel }}-keycloak-jwt
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $rel }}-keycloak-jwt
+  labels:
+    konghq.com/credential: jwt
+    {{- include "dp.commonLabels" . | nindent 4 }}
+stringData:
+  key: {{ .Values.config.keycloakIssuerUri | quote }}
+  algorithm: RS256
+  rsa_public_key: |-
+{{ .Values.gateway.jwt.rsaPublicKey | indent 4 }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,58 @@
+{{- /*
+Shared, release-aware environment for every service. Cross-service and infra
+addresses are derived from the release name here so they always match the
+Services this chart creates. When in-cluster infra is enabled the host/URL is
+rewritten to the bundled Service; otherwise the external config.* value is used.
+*/ -}}
+{{- $semanticPort := (index .Values.services "semantic-service").port -}}
+{{- $redisHost := .Values.config.redisHost -}}
+{{- if .Values.infra.redis.enabled }}{{ $redisHost = printf "%s-redis" .Release.Name }}{{ end -}}
+{{- $iamDbUrl := .Values.config.iamDbUrl -}}
+{{- if .Values.infra.postgresql.enabled }}{{ $iamDbUrl = printf "jdbc:postgresql://%s-postgresql:5432/%s" .Release.Name .Values.infra.postgresql.database }}{{ end -}}
+{{- /* When services.cube is enabled, semantic-service reaches the in-cluster cube Service
+       instead of the external config.cubeApiUrl/cubeSqlUrl (same pattern as redis/iamDbUrl above). */ -}}
+{{- $cubeApiUrl := .Values.config.cubeApiUrl -}}
+{{- $cubeSqlUrl := .Values.config.cubeSqlUrl -}}
+{{- if (index .Values.services "cube").enabled }}
+{{- $cubeApiUrl = printf "http://%s-cube:%v/cubejs-api/v1" .Release.Name (index .Values.services "cube").port }}
+{{- $cubeSqlUrl = printf "jdbc:postgresql://%s-cube:15432/cube" .Release.Name }}
+{{- end -}}
+{{- /* OTLP traces target the in-cluster collector when it's deployed, else the configured endpoint. */ -}}
+{{- $otlp := .Values.observability.otlpEndpoint -}}
+{{- if .Values.observability.collector.enabled }}{{ $otlp = printf "http://%s-otel-collector:4318/v1/traces" .Release.Name }}{{ end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+data:
+  SPRING_PROFILES_ACTIVE: {{ .Values.config.springProfilesActive | quote }}
+  # Cross-service (chat -> semantic) address, derived from the release name.
+  SEMANTIC_API_URL: {{ printf "http://%s-semantic-service:%v" .Release.Name $semanticPort | quote }}
+  # Cube.dev — consumed by semantic-service (the gateway) as its upstream address.
+  CUBE_API_URL: {{ $cubeApiUrl | quote }}
+  CUBE_SQL_URL: {{ $cubeSqlUrl | quote }}
+  CUBE_SQL_USER: {{ .Values.config.cubeSqlUser | quote }}
+  # Cube.dev's OWN upstream (StarRocks) — only read by the `cube` pod itself, when
+  # services.cube.enabled. StarRocks/Postgres stay external either way.
+  CUBEJS_DB_TYPE: {{ .Values.config.cubeDbType | quote }}
+  CUBEJS_DB_HOST: {{ .Values.config.cubeDbHost | quote }}
+  CUBEJS_DB_PORT: {{ .Values.config.cubeDbPort | quote }}
+  CUBEJS_DB_USER: {{ .Values.config.cubeDbUser | quote }}
+  CUBEJS_DB_NAME: {{ .Values.config.cubeDbName | quote }}
+  CUBEJS_DEV_MODE: {{ .Values.config.cubeDevMode | quote }}
+  # Redis (chat memory + semantic cache)
+  REDIS_HOST: {{ $redisHost | quote }}
+  REDIS_PORT: {{ .Values.config.redisPort | quote }}
+  CHAT_MEMORY: {{ .Values.config.chatMemory | quote }}
+  # iam-service datasource
+  DB_URL: {{ $iamDbUrl | quote }}
+  # Keycloak
+  KEYCLOAK_SERVER_URL: {{ .Values.config.keycloakServerUrl | quote }}
+  KEYCLOAK_ISSUER_URI: {{ .Values.config.keycloakIssuerUri | quote }}
+  KEYCLOAK_REALM: {{ .Values.config.keycloakRealm | quote }}
+  # Observability: OTLP trace export + sampling + environment tag.
+  OTLP_TRACING_ENDPOINT: {{ $otlp | quote }}
+  TRACING_SAMPLE_RATE: {{ .Values.observability.tracingSampleRate | quote }}
+  APP_ENV: {{ .Values.observability.environment | quote }}

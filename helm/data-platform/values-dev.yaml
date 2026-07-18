@@ -1,0 +1,60 @@
+# Dev overlay: self-contained cluster for local testing (kind / minikube's docker
+# driver — both resolve host.docker.internal via Docker Desktop). In-cluster Redis +
+# Postgres are enabled; autoscaling floors are lowered to fit a laptop. Cube.dev runs
+# IN-cluster (services.cube, same as prod) with a locally built/kind-loaded image;
+# StarRocks + Keycloak stay external — run them via cube-semantic-demo's
+# docker-compose and this file points config.cubeDb*/keycloak* at that host.
+#
+# helm upgrade --install dp ./helm/data-platform -f values-dev.yaml
+
+observability:
+  environment: "dev"
+  tracingSampleRate: "1.0"     # sample everything locally
+  collector:
+    enabled: true              # in-cluster collector; point it at your Tempo
+    tempoEndpoint: "tempo:4317"
+
+config:
+  springProfilesActive: "dev,json"
+  # Reach docker-compose services on the host from inside kind (Docker Desktop
+  # resolves host.docker.internal for every container, kind nodes included).
+  cubeDbHost: "host.docker.internal"
+  keycloakServerUrl: "http://host.docker.internal:8080"
+  keycloakIssuerUri: "http://host.docker.internal:8080/realms/data-platform"
+
+infra:
+  redis:
+    enabled: true
+    persistence:
+      enabled: false
+  postgresql:
+    enabled: true
+    persistence:
+      enabled: false        # ephemeral for dev
+
+services:
+  semantic-service:
+    autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3 }
+    resources:
+      requests: { cpu: 100m, memory: 384Mi }
+      limits:   { cpu: 500m, memory: 768Mi }
+  chat-service:
+    autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3 }
+    resources:
+      requests: { cpu: 100m, memory: 384Mi }
+      limits:   { cpu: 500m, memory: 768Mi }
+  iam-service:
+    autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3 }
+    resources:
+      requests: { cpu: 100m, memory: 384Mi }
+      limits:   { cpu: 500m, memory: 768Mi }
+  data-platform-ui:
+    autoscaling: { enabled: false }
+    replicas: 1
+  cube:
+    image:
+      repository: cube-semantic     # built + `kind load docker-image`'d locally, no registry pull
+      pullPolicy: IfNotPresent
+    resources:
+      requests: { cpu: 100m, memory: 384Mi }
+      limits:   { cpu: 500m, memory: 768Mi }
