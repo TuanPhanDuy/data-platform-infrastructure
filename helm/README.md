@@ -28,7 +28,7 @@ lives in the `data-platform` app-source checkout's `gateway/` folder, not in thi
 
 ### `cube`: baked-in model, CI-driven tag
 
-Unlike the other services, `cube`'s image isn't built by hand — `cube-semantic-demo`'s
+Unlike the other services, `cube`'s image isn't built by hand — `cube-semantic`'s
 `.github/workflows/model-ci.yml` bakes the validated Cube YAML model into an image and bumps
 `services.cube.image.tag` in this chart's `values.yaml` as its last step. **That commit is the
 deploy** — see [`../docs/HLD.md`](../docs/HLD.md) for the full loop. StarRocks/Postgres (what
@@ -37,7 +37,7 @@ Cube queries) stay external either way — point `config.cubeDb*` at wherever St
 ### Backing services (Postgres, Redis, StarRocks, Keycloak)
 External by default — best practice for stateful systems. Point `config.*` at managed offerings
 (managed Postgres, ElastiCache/managed Redis, a Keycloak operator or managed IdP). StarRocks (and
-the Postgres it federates from) is never bundled — run it via `cube-semantic-demo`'s
+the Postgres it federates from) is never bundled — run it via `cube-semantic`'s
 docker-compose, or a dedicated operator, and set `config.cubeDb*` to reach it. For local testing,
 `values-dev.yaml` turns on throwaway in-cluster Redis + Postgres for the *app* services.
 
@@ -52,7 +52,7 @@ docker build -t $REG/data-platform/data-platform-ui:1.0.0 \
   data-platform-ui
 docker push $REG/data-platform/...
 ```
-`cube`'s image is built by `cube-semantic-demo`'s CI, not by hand — see above.
+`cube`'s image is built by `cube-semantic`'s CI, not by hand — see above.
 
 ## 2. Deploy
 

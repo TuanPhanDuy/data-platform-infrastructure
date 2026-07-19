@@ -2,7 +2,7 @@
 
 Implementation detail for the pipeline described in **[HLD.md](./HLD.md)**: the
 `POST /api/model/validate` contract, the Helm values this repo adds, the ArgoCD `Application`
-spec, and both `cube-semantic-demo` CI jobs as sequence diagrams.
+spec, and both `cube-semantic` CI jobs as sequence diagrams.
 
 ---
 
@@ -70,7 +70,7 @@ cube:
   enabled: true
   image:
     repository: ghcr.io/tuanphanduy/cube-semantic
-    tag: ""                    # bumped by cube-semantic-demo's CI to the git sha
+    tag: ""                    # bumped by cube-semantic's CI to the git sha
   port: 4000                   # REST + GraphQL + Playground
   extraPorts:
     - { name: sql, port: 15432 }   # Cube SQL API — semantic-service's /sql-rewrite
@@ -131,7 +131,7 @@ this Application owns gets reverted on the next reconcile — the git state alwa
 
 ---
 
-## 4. `cube-semantic-demo/.github/workflows/model-ci.yml` — sequence diagrams
+## 4. `cube-semantic/.github/workflows/model-ci.yml` — sequence diagrams
 
 ### 4.1 `validate` job
 
@@ -196,7 +196,7 @@ kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/st
 kubectl -n argocd wait --for=condition=available --timeout=300s deploy/argocd-server
 
 # Images built locally and loaded directly into kind's nodes — no registry push needed for this.
-docker build -t cube-semantic:test cube/            # (from cube-semantic-demo)
+docker build -t cube-semantic:test cube/            # (from cube-semantic)
 kind load docker-image cube-semantic:test --name data-platform
 docker build -t semantic-service:test semantic-service/
 kind load docker-image semantic-service:test --name data-platform

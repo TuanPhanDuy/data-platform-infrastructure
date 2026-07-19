@@ -1,7 +1,7 @@
 # data-platform-infrastructure
 
 The **GitOps / infrastructure repo** for the [data-platform](https://github.com/TuanPhanDuy)
-semantic platform (`cube-semantic-demo`, `semantic-service`, `chat-service`, `iam-service`,
+semantic platform (`cube-semantic`, `semantic-service`, `chat-service`, `iam-service`,
 `data-platform-ui`). Kept separate from those application-source repos on purpose: ArgoCD watches
 *this* repo, not each app's source — app CI pipelines only ever end with a commit here, never a
 direct cluster mutation.
@@ -41,7 +41,7 @@ kubectl get application data-platform -n argocd -w
 kubectl get pods -n data-platform
 ```
 
-From here on, changes to this repo (a Helm values edit, or `cube-semantic-demo`'s CI bumping
+From here on, changes to this repo (a Helm values edit, or `cube-semantic`'s CI bumping
 `services.cube.image.tag` after a validated model change) are the *only* way the cluster changes
 — see `docs/HLD.md` for why, and `docs/LLD.md` for exactly how the local `kind` cluster proof
 for this was run.

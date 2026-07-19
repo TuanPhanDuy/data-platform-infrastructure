@@ -25,13 +25,13 @@ config:
   springProfilesActive: "prod,json"
   # Cube.dev — semantic-service's upstream. Ignored (auto-rewritten to the in-cluster
   # Service) when services.cube.enabled=true; only used when Cube is external (Cube
-  # Cloud, or cube-semantic-demo's docker-compose during local dev).
+  # Cloud, or cube-semantic's docker-compose during local dev).
   cubeApiUrl: "http://cube:4000/cubejs-api/v1"
   cubeSqlUrl: "jdbc:postgresql://cube:15432/cube"
   cubeSqlUser: "cube"
   # Cube.dev's OWN connection to StarRocks — only read by the `cube` pod itself
   # (services.cube.enabled=true). StarRocks/Postgres are never bundled; point these
-  # at wherever StarRocks actually runs (cube-semantic-demo's docker-compose in dev).
+  # at wherever StarRocks actually runs (cube-semantic's docker-compose in dev).
   cubeDbType: "mysql"
   cubeDbHost: "starrocks"
   cubeDbPort: "9030"
@@ -56,8 +56,8 @@ appSecret:
   create: true
   name: ""            # empty -> "<release>-secret"
   data:
-    CUBE_API_SECRET: "demo-secret-change-me-please-32bytes-min"
-    CUBE_SQL_PASSWORD: "demo-secret-change-me"
+    CUBE_API_SECRET: "cube-secret-change-me-please-32bytes-min"
+    CUBE_SQL_PASSWORD: "cube-secret-change-me"
     DB_PASSWORD: "iam"
     KEYCLOAK_ADMIN_CLIENT_SECRET: "iam-service-secret"
 
@@ -179,7 +179,7 @@ services:
       minAvailable: 1
     env: {}
 
-  # The Cube.dev semantic layer itself. Image is built + pushed by cube-semantic-demo's
+  # The Cube.dev semantic layer itself. Image is built + pushed by cube-semantic's
   # model-ci.yml with the YAML model baked in (immutable per-commit image, not a bind mount) —
   # bumping .image.tag here IS the GitOps deploy; see docs/HLD.md. Single-instance (Cube dev-mode
   # keeps its pre-aggregation cache in Cube Store, not locally, so this is safe but not
@@ -243,7 +243,7 @@ ingress:
 # grade. Best practice: keep these OFF in prod and use managed Postgres,
 # managed Redis, Cube Cloud, and a Keycloak operator / managed IdP. StarRocks
 # (and Postgres, the system of record it federates) are intentionally NOT
-# bundled — run them via cube-semantic-demo's docker-compose, or a dedicated
+# bundled — run them via cube-semantic's docker-compose, or a dedicated
 # operator, and set config.cubeDb* to reach them. Cube.dev ITSELF is bundled
 # (services.cube above) since its model is what this repo's GitOps loop syncs.
 # ---------------------------------------------------------------------------

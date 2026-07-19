@@ -2,7 +2,7 @@
 # driver — both resolve host.docker.internal via Docker Desktop). In-cluster Redis +
 # Postgres are enabled; autoscaling floors are lowered to fit a laptop. Cube.dev runs
 # IN-cluster (services.cube, same as prod) with a locally built/kind-loaded image;
-# StarRocks + Keycloak stay external — run them via cube-semantic-demo's
+# StarRocks + Keycloak stay external — run them via cube-semantic's
 # docker-compose and this file points config.cubeDb*/keycloak* at that host.
 #
 # helm upgrade --install dp ./helm/data-platform -f values-dev.yaml

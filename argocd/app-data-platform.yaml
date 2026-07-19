@@ -1,5 +1,5 @@
 # ArgoCD Application for the data-platform Helm chart. Pull-based GitOps: ArgoCD watches this
-# repo and reconciles the cluster to match it — nothing (including cube-semantic-demo's CI)
+# repo and reconciles the cluster to match it — nothing (including cube-semantic's CI)
 # ever runs kubectl/helm against the cluster directly. See ../docs/HLD.md.
 #
 # This is the DEV/local instance (values.yaml + values-dev.yaml, targets a kind cluster). For a

@@ -82,6 +82,6 @@ services:
     autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6 }
   cube:
     enabled: false   # this example targets Cube Cloud (external) — see config.cubeApiUrl above
-  # No pinned tag here on purpose: cube-semantic-demo's model-ci.yml bumps
+  # No pinned tag here on purpose: cube-semantic's model-ci.yml bumps
   # services.cube.image.tag to the git SHA that introduced the last validated
   # model change — ArgoCD syncing THAT commit is the actual deploy.
