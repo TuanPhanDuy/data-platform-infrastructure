@@ -2,17 +2,16 @@
 # repo and reconciles the cluster to match it — nothing (including cube-semantic's CI)
 # ever runs kubectl/helm against the cluster directly. See ../docs/HLD.md.
 #
-# This is the DEV/local instance (values.yaml + values-dev.yaml, targets a kind cluster). For a
-# real prod ArgoCD project: copy this file, drop values-dev.yaml for values-prod.yaml, point
-# `destination` at the prod cluster/namespace, and register it under a non-"default" ArgoCD
-# Project with tighter RBAC.
+# This is the DEV/local instance (values.yaml + values-dev.yaml, targets a kind cluster). See
+# the sibling app-data-platform-staging.yaml and app-data-platform-prod.yaml for the other SDLC
+# stages — same chart, different values overlay + destination + (for prod) tighter project RBAC.
 #
 # Bootstrap (once ArgoCD itself is installed in the cluster):
-#   kubectl apply -f argocd/app-data-platform.yaml
+#   kubectl apply -f argocd/app-data-platform-dev.yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: data-platform
+  name: data-platform-dev
   namespace: argocd
   finalizers:
     - resources-finalizer.argocd.argoproj.io

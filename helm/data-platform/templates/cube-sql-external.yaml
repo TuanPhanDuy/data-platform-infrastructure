@@ -1,0 +1,30 @@
+{{- $cube := index .Values.services "cube" -}}
+{{- if and $cube.enabled $cube.sqlExternal.enabled }}
+{{- /* Exposes Cube's SQL API (Postgres wire protocol, port 15432) outside the cluster for
+       clients the ClusterIP Service in templates/service.yaml can't reach: Power BI Desktop,
+       an external Superset. See values.yaml's services.cube.sqlExternal for the on/off switch
+       and helm/README.md "BI tool connections" for how to point a BI tool at this. */ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-cube-sql-external
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+    {{- include "dp.selectorLabels" (dict "root" . "name" "cube") | nindent 4 }}
+  {{- with $cube.sqlExternal.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $cube.sqlExternal.type }}
+  selector:
+    {{- include "dp.selectorLabels" (dict "root" . "name" "cube") | nindent 4 }}
+  ports:
+    - name: sql
+      port: 15432
+      targetPort: sql
+      protocol: TCP
+      {{- if and (eq $cube.sqlExternal.type "NodePort") $cube.sqlExternal.nodePort }}
+      nodePort: {{ $cube.sqlExternal.nodePort }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,19 @@
+{{- if .Values.superset.enabled }}
+{{- /*
+Minimal superset_config.py: SECRET_KEY and SQLALCHEMY_DATABASE_URI are both read from env vars
+the Deployment sets (templates/superset-deployment.yaml), not hardcoded here, so the same image
+works unmodified across dev/staging/prod.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-superset-config
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+data:
+  superset_config.py: |
+    import os
+
+    SECRET_KEY = os.environ["SUPERSET_SECRET_KEY"]
+    SQLALCHEMY_DATABASE_URI = os.environ["SQLALCHEMY_DATABASE_URI"]
+{{- end }}

@@ -1,0 +1,31 @@
+{{- if and .Values.superset.enabled .Values.superset.ingress.enabled }}
+{{- /* Standalone Ingress, decoupled from the gateway.provider (kong) abstraction the app
+       services use — Superset has its own auth, it doesn't need Kong's JWT/authz plugins. */ -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-superset
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+  {{- with .Values.superset.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- with .Values.superset.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.superset.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-superset
+                port:
+                  number: {{ .Values.superset.port }}
+{{- end }}

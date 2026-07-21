@@ -1,0 +1,103 @@
+# Staging overlay: external managed backing services (staging-tier Redis/Postgres/Keycloak),
+# same shape as values-prod.yaml but smaller and NOT pinned. Unlike values-prod.yaml, Cube.dev
+# stays IN-CLUSTER here (services.cube isn't overridden, so it keeps the values.yaml default of
+# enabled: true) — that's deliberate: cube-semantic's CI bumps services.cube.image.tag on
+# values.yaml directly (see docs/HLD.md), and this is the overlay that change reaches
+# automatically. Staging is the continuous-deploy proving ground a model change goes through
+# before someone deliberately pins values-prod.yaml's tags to promote it further.
+#
+# helm upgrade --install dp ./helm/data-platform -n data-platform-staging -f values-staging.yaml
+
+global:
+  imageRegistry: "registry.example.com/"
+  imagePullSecrets:
+    - name: registry-creds
+
+observability:
+  environment: "staging"
+  tracingSampleRate: "0.25"    # more than prod's 5%, less than dev's "sample everything"
+  prometheusAnnotations:
+    enabled: false
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
+  collector:
+    enabled: true
+    tempoEndpoint: "tempo-distributor.observability.svc:4317"
+
+config:
+  springProfilesActive: "staging,json"
+  redisHost: "redis.staging.internal"          # managed Redis / ElastiCache, staging tier
+  iamDbUrl: "jdbc:postgresql://iam-db.staging.internal:5432/iam"   # managed Postgres, staging tier
+  keycloakServerUrl: "https://sso-staging.example.com"
+  keycloakIssuerUri: "https://sso-staging.example.com/realms/data-platform"
+  # cubeApiUrl/cubeSqlUrl/cubeDb* left at values.yaml's defaults: services.cube.enabled stays
+  # true, so the chart auto-rewrites semantic-service to the in-cluster cube Service anyway
+  # (see templates/configmap.yaml) and config.cubeDb* keeps pointing at StarRocks.
+
+# Do NOT ship secrets in git. Pre-create a Secret (sealed-secrets / external-secrets / vault).
+appSecret:
+  create: false
+  name: "data-platform-staging-secrets"
+
+# Keep all stateful app-service infra external, same reasoning as prod.
+infra:
+  redis:
+    enabled: false
+  postgresql:
+    enabled: false
+
+ingress:
+  host: data-platform-staging.example.com
+  tls:
+    - secretName: data-platform-staging-tls
+      hosts:
+        - data-platform-staging.example.com
+
+gateway:
+  provider: kong
+  host: data-platform-staging.example.com
+  tls:
+    - secretName: data-platform-staging-tls
+      hosts:
+        - data-platform-staging.example.com
+  jwt:
+    enabled: true
+    # Inject the realm's RS256 public key (PEM) via your secrets tooling, e.g.
+    #   --set-file gateway.jwt.rsaPublicKey=realm-pubkey.pem
+    rsaPublicKey: ""
+
+# No pinned image tags here on purpose: app-service images still tag "" -> Chart.appVersion the
+# same way values-dev.yaml does (per helm/README.md, those services' release pipelines are hand-run
+# and out of this chart's scope) — staging tracks whatever was last built, prod is what pins.
+services:
+  semantic-service:
+    autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 4, targetCPUUtilizationPercentage: 70 }
+  chat-service:
+    autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 4, targetCPUUtilizationPercentage: 65 }
+  iam-service:
+    autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3 }
+  data-platform-ui:
+    autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 2 }
+  cube:
+    # image.tag: no override — tracks values.yaml's services.cube.image.tag directly (see
+    # header note). sqlExternal IS overridden: staging is a real cluster (unlike dev's kind),
+    # so a LoadBalancer actually gets Power BI Desktop / an external Superset a reachable IP.
+    sqlExternal:
+      enabled: true
+      type: LoadBalancer
+
+# Self-hosted Superset. infra.postgresql is off in this overlay (external infra everywhere),
+# so metadataDbUrl points at a real staging Postgres instead of values.yaml's in-cluster
+# default — provision that database/role out of band, same as iam-service's.
+superset:
+  enabled: true
+  ingress:
+    enabled: true
+    host: superset-staging.example.com
+    tls:
+      - secretName: superset-staging-tls
+        hosts:
+          - superset-staging.example.com
+  metadataDbUrl: "postgresql+psycopg2://superset:$(SUPERSET_DB_PASS)@superset-db.staging.internal:5432/superset"

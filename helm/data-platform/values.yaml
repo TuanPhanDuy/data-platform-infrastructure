@@ -60,6 +60,10 @@ appSecret:
     CUBE_SQL_PASSWORD: "cube-secret-change-me"
     DB_PASSWORD: "iam"
     KEYCLOAK_ADMIN_CLIENT_SECRET: "iam-service-secret"
+    SUPERSET_SECRET_KEY: "superset-secret-change-me-please-32bytes-min"
+    SUPERSET_ADMIN_PASSWORD: "superset-admin-change-me"
+    # Only read when infra.postgresql.enabled=false (superset.metadataDbUrl points external).
+    SUPERSET_DB_PASSWORD: "superset-db-change-me"
 
 # ---------------------------------------------------------------------------
 # Stateless application services. Structurally identical, rendered by a range
@@ -212,9 +216,85 @@ services:
       runAsNonRoot: false
     # Cube.dev expects CUBEJS_API_SECRET; appSecret stores it as CUBE_API_SECRET (the name
     # semantic-service's own config uses) — envFrom.secretRef can't rename keys, so map it here.
+    # Same reason CUBEJS_SQL_USER/PASSWORD are mapped below: Cube Core's SQL API is DISABLED
+    # BY DEFAULT and needs its own CUBEJS_PG_SQL_PORT/CUBEJS_SQL_USER/CUBEJS_SQL_PASSWORD env
+    # vars to turn on — config.cubeSqlUser/appSecret.CUBE_SQL_PASSWORD only tell *clients*
+    # (semantic-service, Superset, Power BI) what to authenticate with; without these three,
+    # nothing is actually listening on the `sql` port declared above.
     envSecret:
       CUBEJS_API_SECRET: CUBE_API_SECRET
-    env: {}
+      CUBEJS_SQL_PASSWORD: CUBE_SQL_PASSWORD
+    env:
+      CUBEJS_PG_SQL_PORT: "15432"     # must match extraPorts[].port above
+      CUBEJS_SQL_USER: "cube"          # must match config.cubeSqlUser
+    # Expose the SQL API (port 15432) outside the cluster for external BI tools (Power BI
+    # Desktop, an external Superset) that can't reach the in-cluster ClusterIP Service. OFF by
+    # default — this is a credentialed Postgres-wire endpoint, opt in per environment. See
+    # values-staging.yaml for a LoadBalancer example; for local dev prefer
+    # `kubectl port-forward svc/<release>-cube 15432:15432` instead of turning this on.
+    sqlExternal:
+      enabled: false
+      type: LoadBalancer          # LoadBalancer | NodePort
+      annotations: {}
+      nodePort: null               # only used when type: NodePort
+
+# ---------------------------------------------------------------------------
+# Apache Superset — self-hosted BI tool, pre-wired to Cube's SQL API as a Postgres-compatible
+# data source (Cube exposes cubes as tables; see docs.cube.dev/.../sql-api). Not part of the
+# `services:` range above because it needs its own metadata database + first-boot admin/init
+# steps that don't fit that generic template. OFF by default; see values-dev.yaml /
+# values-staging.yaml for enabled examples. Power BI Desktop (a client app, nothing to deploy)
+# connects the same way — see helm/README.md "BI tool connections".
+#
+# The stock apache/superset image ships with NO Postgres driver (confirmed empirically: `import
+# psycopg2` fails) — templates/superset-deployment.yaml installs psycopg2-binary into a shared
+# emptyDir at pod startup so both the metadata-DB connection and the Cube connection work
+# unmodified. Costs ~10-20s of extra startup latency pulling from PyPI; swap in a custom image
+# with the driver baked in (`FROM apache/superset:3.1.3` + `pip install psycopg2-binary`) for
+# production if that latency/PyPI dependency at boot isn't acceptable.
+# ---------------------------------------------------------------------------
+superset:
+  enabled: false
+  image:
+    repository: apache/superset
+    tag: "3.1.3"
+    pullPolicy: IfNotPresent
+  port: 8088
+  replicas: 1                   # single instance: simplest way to avoid concurrent first-boot
+                                 # admin-creation/db-upgrade races; scale up once that's handled.
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits:   { cpu: "1",  memory: 2Gi }
+  probes:
+    initialDelaySeconds: 30
+  admin:
+    username: admin
+    firstName: Superset
+    lastName: Admin
+    email: admin@example.com
+    # password: appSecret.data.SUPERSET_ADMIN_PASSWORD
+  # Superset's own metadata store (dashboards, users, saved connections — NOT your data).
+  # In-cluster: reuses infra.postgresql's instance, a second "superset" database alongside
+  # iam-service's, dev-only (same pattern as config.iamDbUrl). Set infra.postgresql.enabled:
+  # false and metadataDbUrl below for a managed Postgres in prod/staging.
+  metadataDb:
+    database: superset
+  # Full SQLAlchemy URI for an EXTERNAL metadata Postgres. Embed the literal placeholder
+  # "$(SUPERSET_DB_PASS)" where the password goes — Kubernetes expands it from appSecret's
+  # SUPERSET_DB_PASSWORD key at container start. Only used when infra.postgresql.enabled=false.
+  metadataDbUrl: "postgresql+psycopg2://superset:$(SUPERSET_DB_PASS)@superset-db.internal:5432/superset"
+  cube:
+    # Pre-registers Cube's SQL API as a Superset database connection on first boot
+    # (`superset set-database-uri`), pointed at the same in-cluster/external cube address
+    # semantic-service's CUBE_SQL_URL uses (see templates/configmap.yaml). Set false to add
+    # the connection by hand instead (Data > Databases > + Database in the Superset UI).
+    registerConnection: true
+    connectionName: "Cube"
+  ingress:
+    enabled: false
+    host: superset.data-platform.local
+    annotations: {}
+    tls: []
 
 # ---------------------------------------------------------------------------
 # Ingress. Single host; the UI at "/" and each backend under an /api/* prefix

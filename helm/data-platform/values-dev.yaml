@@ -58,3 +58,15 @@ services:
     resources:
       requests: { cpu: 100m, memory: 384Mi }
       limits:   { cpu: 500m, memory: 768Mi }
+    # sqlExternal stays off here on purpose: kind doesn't expose NodePort/LoadBalancer to the
+    # host without extra cluster config. For local Power BI / an external Superset, use:
+    #   kubectl port-forward svc/dp-cube 15432:15432
+
+# Self-hosted Superset, pre-wired to the in-cluster Cube SQL API (see values.yaml's
+# `superset:` block for what "pre-wired" means). Reaches it via `kubectl port-forward
+# svc/dp-superset 8088:8088` — ingress stays off in dev, same reasoning as cube.sqlExternal above.
+superset:
+  enabled: true
+  resources:
+    requests: { cpu: 100m, memory: 384Mi }
+    limits:   { cpu: 500m, memory: 1Gi }

@@ -62,15 +62,23 @@ StarRocks — see `docs/LLD.md` for the exact commands used to prove this with a
 helm upgrade --install dp ./helm/data-platform -f ./helm/data-platform/values-dev.yaml
 ```
 
-Production (external infra, images from a private registry, pre-created secret):
+Staging (external infra, Cube stays in-cluster so `cube-semantic`'s CI-driven tag bump reaches
+it automatically — see `docs/HLD.md`):
+```bash
+kubectl create namespace data-platform-staging
+helm upgrade --install dp ./helm/data-platform -n data-platform-staging -f ./helm/data-platform/values-staging.yaml
+```
+
+Production (external infra, images from a private registry, pre-created secret, pinned tags):
 ```bash
 kubectl create namespace data-platform
 # provision the Secret named in values-prod.yaml (appSecret.name) out of band first
 helm upgrade --install dp ./helm/data-platform -n data-platform -f ./helm/data-platform/values-prod.yaml
 ```
 
-In practice neither command runs by hand against a real cluster — ArgoCD runs the equivalent
-`helm upgrade` for you on every reconcile. See [`../argocd/`](../argocd/).
+In practice none of these commands run by hand against a real cluster — ArgoCD runs the
+equivalent `helm upgrade` for you on every reconcile, one `Application` per stage. See
+[`../argocd/`](../argocd/).
 
 ## 3. Verify & watch scaling
 
@@ -94,6 +102,54 @@ ingress controller, then open `http://data-platform.local/`.
 
 By default (`gateway.provider: kong`) the chart fronts the services with **Kong** via the Kong
 Ingress Controller instead of the plain nginx Ingress. Set `gateway.provider: nginx` to fall back.
+
+## BI tool connections (Superset, Power BI)
+
+Cube's SQL API speaks the Postgres wire protocol — any tool with a Postgres connector can query
+it, and cubes show up as tables (measures/dimensions as columns). Two prerequisites, both handled
+by this chart:
+
+1. **The SQL API must actually be enabled.** Cube Core has it off by default; `services.cube.env`
+   sets `CUBEJS_PG_SQL_PORT`/`CUBEJS_SQL_USER` and `envSecret` maps `CUBEJS_SQL_PASSWORD` from
+   `appSecret.data.CUBE_SQL_PASSWORD` (values.yaml). Credentials: user = `config.cubeSqlUser`
+   (default `cube`), password = that secret key, database = literal `cube` (Cube Core ignores the
+   db name — any string works, this chart's convention matches `config.cubeSqlUrl`).
+2. **Something outside the cluster needs to reach port 15432.** The chart's normal Service is
+   ClusterIP-only. `values-dev.yaml`: `kubectl port-forward svc/<release>-cube 15432:15432`.
+   `values-staging.yaml`: `services.cube.sqlExternal.enabled: true` (LoadBalancer) — get the
+   external IP with `kubectl get svc <release>-cube-sql-external -w`.
+
+### Superset (self-hosted, in-cluster)
+
+`superset.enabled: true` (already on in `values-dev.yaml`/`values-staging.yaml`) deploys Superset
+with its own metadata Postgres (a second database on `infra.postgresql`'s instance in dev, an
+external one via `superset.metadataDbUrl` in staging/prod) and, on first boot, an init container
+that runs `superset db upgrade`, creates the admin user (`superset.admin.*` +
+`appSecret.data.SUPERSET_ADMIN_PASSWORD`), and pre-registers Cube as a database connection
+(`superset set-database-uri`, named `superset.cube.connectionName`) — nothing to configure by
+hand. Reach the UI via `kubectl port-forward svc/<release>-superset 8088:8088` (dev) or
+`superset.ingress.host` (staging), log in with the admin credentials, and the "Cube" database is
+already there under Data > Databases — go straight to Data > Datasets to build one against a cube.
+
+Set `superset.cube.registerConnection: false` to skip the auto-registration and add the
+connection by hand instead (Data > Databases > + Database > PostgreSQL), using the same
+host/port/user/password/db as above (in-cluster host is `<release>-cube`, e.g. `dp-cube`).
+
+### Power BI Desktop
+
+Power BI Desktop is a client app — there's nothing to deploy for it, it just needs network
+access to port 15432 (see prerequisite 2 above) and the native PostgreSQL connector:
+
+1. **Get Data > Database > PostgreSQL database.**
+2. **Server**: the port-forwarded/LoadBalancer host, e.g. `localhost:15432` or the external IP
+   from `kubectl get svc <release>-cube-sql-external`. **Database**: `cube`.
+3. Pick **Import** or **DirectQuery** (DirectQuery keeps queries live against Cube but means
+   re-syncing the semantic model manually as cubes change; Import is simpler to start with).
+4. Credentials: **Database** auth, user = `config.cubeSqlUser` (`cube`), password = the
+   `CUBE_SQL_PASSWORD` secret value (`kubectl get secret <release>-secret -o jsonpath='{.data.CUBE_SQL_PASSWORD}' | base64 -d`).
+   Cube's SQL API doesn't terminate TLS by default, so leave **Encrypt connection** off unless
+   you've put a TLS-terminating proxy in front of it.
+5. Your cubes appear as tables in the Navigator — measures and dimensions as columns.
 
 ## Observability
 
