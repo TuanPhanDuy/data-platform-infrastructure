@@ -1,0 +1,49 @@
+# ArgoCD Application for the data-platform Helm chart — STAGING. Same pull-based GitOps model as
+# app-data-platform-dev.yaml (see ../docs/HLD.md): ArgoCD reconciles the cluster to match this
+# repo, nothing else ever runs kubectl/helm against it.
+#
+# Tracks values.yaml + values-staging.yaml. Deliberately watches the same `main` branch as dev
+# and prod — the environment split comes entirely from the values overlay, not the git ref.
+# services.cube stays enabled here (values-staging.yaml doesn't override it), so
+# cube-semantic's CI-driven `services.cube.image.tag` bump on values.yaml (the commit that IS
+# the deploy, per HLD.md) lands here automatically on every reconcile. That makes staging the
+# continuous-deploy proving ground for a model change BEFORE anyone deliberately edits
+# values-prod.yaml's pinned image tags to promote it further — see app-data-platform-prod.yaml.
+#
+# Bootstrap (once ArgoCD itself is installed in the cluster):
+#   kubectl apply -f argocd/app-data-platform-staging.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: data-platform-staging
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/TuanPhanDuy/data-platform-infrastructure.git
+    targetRevision: main
+    path: helm/data-platform
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-staging.yaml
+  destination:
+    # Same cluster as dev in this single-cluster example — point at a dedicated
+    # staging cluster's API server here if/when one exists (out of scope of this repo,
+    # see docs/HLD.md's non-goals on multi-cluster topologies).
+    server: https://kubernetes.default.svc
+    namespace: data-platform-staging
+  syncPolicy:
+    automated:
+      prune: true      # remove resources this repo no longer declares
+      selfHeal: true    # revert manual cluster drift back to what git says
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

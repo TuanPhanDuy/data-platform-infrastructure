@@ -1,0 +1,19 @@
+{{- if .Values.superset.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-superset
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/name: superset
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: superset
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.superset.port }}
+      targetPort: http
+{{- end }}

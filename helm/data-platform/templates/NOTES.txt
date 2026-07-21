@@ -25,3 +25,15 @@ Check rollout:
 NOTE: in-cluster infra is OFF. Ensure config.redisHost / config.iamDbUrl / config.cube*
 point at reachable external services, and that appSecret holds the real credentials.
 {{- end }}
+
+{{- if .Values.superset.enabled }}
+
+Superset: {{ include "dp.resourceName" (dict "root" $ "name" "superset") }}:{{ .Values.superset.port }}
+{{- if .Values.superset.ingress.enabled }}  -> http://{{ .Values.superset.ingress.host }}/
+{{- else }}  (kubectl port-forward svc/{{ include "dp.resourceName" (dict "root" $ "name" "superset") }} 8088:8088){{- end }}
+  Cube is pre-registered as a database connection ("{{ .Values.superset.cube.connectionName }}") — see helm/README.md "BI tool connections".
+{{- end }}
+{{- if (index .Values.services "cube").sqlExternal.enabled }}
+
+Cube SQL API (Postgres wire, for Power BI / an external Superset): kubectl get svc {{ include "dp.resourceName" (dict "root" $ "name" "cube") }}-sql-external -w
+{{- end }}

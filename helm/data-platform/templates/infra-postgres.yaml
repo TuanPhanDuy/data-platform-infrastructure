@@ -1,5 +1,19 @@
 {{- if .Values.infra.postgresql.enabled }}
-{{- /* DEV-ONLY single-replica PostgreSQL for iam-service. Use managed Postgres in prod. */ -}}
+{{- /* DEV-ONLY single-replica PostgreSQL for iam-service (and, when superset.enabled, a second
+       "superset" database on this same instance/role — see templates/superset-deployment.yaml).
+       Use managed Postgres in prod. */ -}}
+{{- if .Values.superset.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-postgresql-initdb
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+data:
+  01-superset-db.sql: |
+    CREATE DATABASE {{ .Values.superset.metadataDb.database }};
+---
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -58,6 +72,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            {{- if .Values.superset.enabled }}
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+            {{- end }}
   {{- if .Values.infra.postgresql.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
@@ -71,10 +89,17 @@ spec:
           requests:
             storage: {{ .Values.infra.postgresql.persistence.size }}
   {{- end }}
-{{- if not .Values.infra.postgresql.persistence.enabled }}
+{{- if or (not .Values.infra.postgresql.persistence.enabled) .Values.superset.enabled }}
       volumes:
+        {{- if not .Values.infra.postgresql.persistence.enabled }}
         - name: data
           emptyDir: {}
+        {{- end }}
+        {{- if .Values.superset.enabled }}
+        - name: initdb
+          configMap:
+            name: {{ .Release.Name }}-postgresql-initdb
+        {{- end }}
 {{- end }}
 ---
 apiVersion: v1

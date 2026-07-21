@@ -106,18 +106,24 @@ keys surfaced as `CUBEJS_DB_*` — Cube's OWN connection to StarRocks, read only
 
 ---
 
-## 3. ArgoCD `Application` (`argocd/app-data-platform.yaml`)
+## 3. ArgoCD `Application`s (`argocd/app-data-platform-{dev,staging,prod}.yaml`)
+
+One `Application` per SDLC stage, all watching this repo's `main` — the split is which values
+overlay each loads, not a different git ref (see README.md "Promoting a change through
+dev → staging → prod"):
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
+metadata:
+  name: data-platform-dev   # -staging / -prod for the siblings
 spec:
   source:
     repoURL: https://github.com/TuanPhanDuy/data-platform-infrastructure.git
     targetRevision: main
     path: helm/data-platform
     helm:
-      valueFiles: [values.yaml, values-dev.yaml]   # values-prod.yaml for a real prod Application
+      valueFiles: [values.yaml, values-dev.yaml]   # -staging.yaml / -prod.yaml for the siblings
   destination:
     server: https://kubernetes.default.svc
     namespace: data-platform
@@ -128,6 +134,13 @@ spec:
 `prune: true` means resources removed from the chart (e.g. disabling a service) are deleted from
 the cluster, not just left orphaned. `selfHeal: true` means a manual `kubectl edit` on anything
 this Application owns gets reverted on the next reconcile — the git state always wins.
+
+`values-staging.yaml` deliberately leaves `services.cube` at `values.yaml`'s default
+(`enabled: true`, no tag override), so the `sync` job's tag bump in §4.2 below reaches the
+staging `Application` on the very next reconcile with zero extra wiring. `values-prod.yaml` pins
+`services.*.image.tag` explicitly and sets `services.cube.enabled: false` (Cube Cloud in that
+example) — promoting a change to prod is a separate, deliberate PR against that file, not an
+automatic consequence of the `sync` job.
 
 ---
 

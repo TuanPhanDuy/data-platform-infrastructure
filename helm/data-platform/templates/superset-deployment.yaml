@@ -1,0 +1,173 @@
+{{- if .Values.superset.enabled }}
+{{- $rel := .Release.Name -}}
+{{- $sec := include "dp.secretName" . -}}
+{{- $cube := index .Values.services "cube" -}}
+{{- /* Metadata DB: in-cluster Postgres (second database alongside iam-service's) when
+       infra.postgresql.enabled, else the external URI in superset.metadataDbUrl — same
+       switch config/configmap.yaml uses for iamDbUrl. */ -}}
+{{- $dbPassKey := "SUPERSET_DB_PASSWORD" -}}
+{{- $dbUri := .Values.superset.metadataDbUrl -}}
+{{- if .Values.infra.postgresql.enabled }}
+{{- $dbPassKey = "DB_PASSWORD" -}}
+{{- $dbUri = printf "postgresql+psycopg2://%s:$(SUPERSET_DB_PASS)@%s-postgresql:5432/%s" .Values.infra.postgresql.username $rel .Values.superset.metadataDb.database -}}
+{{- end -}}
+{{- /* Cube SQL API address: in-cluster Service when services.cube.enabled, else external —
+       same switch templates/configmap.yaml uses for semantic-service's CUBE_SQL_URL. */ -}}
+{{- $cubeSqlHost := "cube" -}}
+{{- if $cube.enabled }}{{ $cubeSqlHost = printf "%s-cube" $rel }}{{ end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $rel }}-superset
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/name: superset
+    app.kubernetes.io/instance: {{ $rel }}
+spec:
+  replicas: {{ .Values.superset.replicas | default 1 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: superset
+      app.kubernetes.io/instance: {{ $rel }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: superset
+        app.kubernetes.io/instance: {{ $rel }}
+      annotations:
+        checksum/superset-config: {{ include (print $.Template.BasePath "/superset-configmap.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: superset-init
+          image: {{ include "dp.image" (dict "root" . "svc" .Values.superset) }}
+          {{- /* The stock apache/superset image ships with NO Postgres driver at all (confirmed:
+                 `import psycopg2` fails out of the box) — every step below that touches a
+                 Postgres URL (db upgrade against SQLALCHEMY_DATABASE_URI, set-database-uri
+                 against Cube) needs it first. Installing at startup (vs. a custom image with it
+                 baked in) keeps this chart working against the unmodified upstream image; the
+                 tradeoff is ~10-20s of extra pod startup time pulling from PyPI. Target dir is a
+                 shared emptyDir (see volumes below), not the image's own site-packages, because
+                 that's root-owned/read-only to the non-root user the main container runs as. */}}
+          securityContext:
+            runAsUser: 0   # only this container: needs to write the shared extra-packages dir
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir --target=/opt/extra-packages psycopg2-binary
+              chmod -R a+rX /opt/extra-packages
+              superset db upgrade
+              superset fab create-admin \
+                --username "$ADMIN_USERNAME" \
+                --firstname "$ADMIN_FIRSTNAME" \
+                --lastname "$ADMIN_LASTNAME" \
+                --email "$ADMIN_EMAIL" \
+                --password "$ADMIN_PASSWORD" || true
+              superset init
+              {{- if .Values.superset.cube.registerConnection }}
+              superset set-database-uri \
+                --database_name "$CUBE_CONNECTION_NAME" \
+                --uri "postgresql+psycopg2://$CUBE_SQL_USER:$CUBE_SQL_PASSWORD@{{ $cubeSqlHost }}:15432/cube" || true
+              {{- end }}
+          env:
+            - name: PYTHONPATH
+              value: "/app/pythonpath:/opt/extra-packages"
+            - name: SUPERSET_DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $sec }}
+                  key: {{ $dbPassKey }}
+            - name: SQLALCHEMY_DATABASE_URI
+              value: {{ $dbUri | quote }}
+            - name: SUPERSET_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $sec }}
+                  key: SUPERSET_SECRET_KEY
+            - name: ADMIN_USERNAME
+              value: {{ .Values.superset.admin.username | quote }}
+            - name: ADMIN_FIRSTNAME
+              value: {{ .Values.superset.admin.firstName | quote }}
+            - name: ADMIN_LASTNAME
+              value: {{ .Values.superset.admin.lastName | quote }}
+            - name: ADMIN_EMAIL
+              value: {{ .Values.superset.admin.email | quote }}
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $sec }}
+                  key: SUPERSET_ADMIN_PASSWORD
+            {{- if .Values.superset.cube.registerConnection }}
+            - name: CUBE_CONNECTION_NAME
+              value: {{ .Values.superset.cube.connectionName | quote }}
+            - name: CUBE_SQL_USER
+              value: {{ .Values.config.cubeSqlUser | quote }}
+            - name: CUBE_SQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $sec }}
+                  key: CUBE_SQL_PASSWORD
+            {{- end }}
+          volumeMounts:
+            - name: superset-config
+              mountPath: /app/pythonpath/superset_config.py
+              subPath: superset_config.py
+            - name: extra-packages
+              mountPath: /opt/extra-packages
+      containers:
+        - name: superset
+          image: {{ include "dp.image" (dict "root" . "svc" .Values.superset) }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.superset.port }}
+          env:
+            - name: PYTHONPATH
+              value: "/app/pythonpath:/opt/extra-packages"
+            - name: SUPERSET_DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $sec }}
+                  key: {{ $dbPassKey }}
+            - name: SQLALCHEMY_DATABASE_URI
+              value: {{ $dbUri | quote }}
+            - name: SUPERSET_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $sec }}
+                  key: SUPERSET_SECRET_KEY
+          volumeMounts:
+            - name: superset-config
+              mountPath: /app/pythonpath/superset_config.py
+              subPath: superset_config.py
+            - name: extra-packages
+              mountPath: /opt/extra-packages
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.superset.probes.initialDelaySeconds | default 30 }}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.superset.probes.initialDelaySeconds | default 30 }}
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.superset.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: superset-config
+          configMap:
+            name: {{ $rel }}-superset-config
+        - name: extra-packages
+          emptyDir: {}
+{{- end }}

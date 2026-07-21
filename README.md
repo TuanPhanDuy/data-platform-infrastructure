@@ -9,7 +9,8 @@ direct cluster mutation.
 ```
 data-platform-infrastructure/
 ├── helm/data-platform/     # the Helm chart ArgoCD deploys — see helm/README.md
-├── argocd/                 # the ArgoCD Application CR(s) that point back at this repo
+├── argocd/                 # one ArgoCD Application per SDLC stage (dev/staging/prod), all
+│                            # pointing back at this repo, each with its own values overlay
 ├── observability/          # Prometheus/Tempo/Loki/Grafana stack + Kubernetes wiring notes
 └── docs/
     ├── HLD.md               # architecture: the full PR -> validate -> build -> sync -> ArgoCD loop
@@ -33,11 +34,12 @@ kubectl create namespace argocd
 kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 kubectl -n argocd wait --for=condition=available --timeout=300s deploy/argocd-server
 
-# 2. Point it at this repo
-kubectl apply -f argocd/app-data-platform.yaml
+# 2. Point it at this repo (dev instance; swap in app-data-platform-staging.yaml /
+#    app-data-platform-prod.yaml for the other SDLC stages — see argocd/)
+kubectl apply -f argocd/app-data-platform-dev.yaml
 
 # 3. Watch it reconcile
-kubectl get application data-platform -n argocd -w
+kubectl get application data-platform-dev -n argocd -w
 kubectl get pods -n data-platform
 ```
 
@@ -45,6 +47,20 @@ From here on, changes to this repo (a Helm values edit, or `cube-semantic`'s CI 
 `services.cube.image.tag` after a validated model change) are the *only* way the cluster changes
 — see `docs/HLD.md` for why, and `docs/LLD.md` for exactly how the local `kind` cluster proof
 for this was run.
+
+## Promoting a change through dev → staging → prod
+
+All three ArgoCD `Application`s in `argocd/` watch the same `main` branch of this repo — the
+environment split is entirely in which values overlay each one loads
+(`values-dev.yaml` / `values-staging.yaml` / `values-prod.yaml`), not a different git ref:
+
+- **dev**: self-contained (in-cluster Redis/Postgres), Cube in-cluster, floating image tags.
+- **staging**: external managed backing services, Cube in-cluster and floating — so
+  `cube-semantic`'s CI-driven `services.cube.image.tag` bump on `values.yaml` (see `docs/HLD.md`)
+  reaches staging automatically, making it the proving ground for a model change.
+- **prod**: external managed backing services, `values-prod.yaml` pins every
+  `services.*.image.tag` explicitly. Promotion to prod is a deliberate, reviewed PR bumping one
+  of those pinned tags — not an automatic consequence of merging to `main`.
 
 ## Where things come from
 
