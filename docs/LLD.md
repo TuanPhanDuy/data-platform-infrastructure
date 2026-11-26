@@ -1,116 +1,102 @@
-# Cube Model CI/CD + GitOps — Low-Level Design (LLD)
+# data-platform GitOps — Low-Level Design (LLD)
 
-Implementation detail for the pipeline described in **[HLD.md](./HLD.md)**: the
-`POST /api/model/validate` contract, the Helm values this repo adds, the ArgoCD `Application`
-spec, and both `cube-semantic` CI jobs as sequence diagrams.
-
----
-
-## 1. `POST /api/model/validate` — API contract
-
-Lives in `semantic-service` (`io.semantic.semantic.controller.ModelController`,
-`io.semantic.semantic.service.ModelValidationService`). Role: `analyst`.
-
-**Request**
-```json
-{
-  "files": [
-    { "path": "cubes/orders_analytics.yml", "content": "cubes:\n  - name: orders_analytics\n    ..." }
-  ]
-}
-```
-`path` only needs to be unambiguous by filename (e.g. `cubes/orders.yml` or just `orders.yml`
-both work) — matching is by filename against the on-disk model directory, not full path.
-
-**Response — always HTTP 200; `valid` carries the outcome**
-```json
-{
-  "valid": false,
-  "errors": [
-    { "file": "orders_analytics.yml",
-      "message": "cube 'orders_analytics' duplicates the one already defined in orders.yml" }
-  ],
-  "warnings": []
-}
-```
-
-**Checks performed** (`ModelValidationService.validate`):
-1. Each submitted file's YAML must parse (SnakeYAML).
-2. Every cube/view definition needs a `name`.
-3. **No two definitions — across the merged (baseline + submitted) set — share a `name`.**
-4. Every cube needs `sql_table` or `sql`.
-5. Every cube needs at least one dimension with `primary_key: true`.
-6. Every `joins[].name` must resolve to a cube/view present in the merged set.
-
-**The merge**, `ModelFileService.readAllWithSource()` (new — extends the existing `readAll()`
-used by `GET /api/model`, same package-visible `normalize()` reused by both):
-```
-baseline := on-disk model, keyed by name, each entry tagged with its source filename
-for each submitted file:
-    baseline := baseline WITHOUT entries whose source == this file's name   # "this file replaces itself"
-for each submitted file (parsed):
-    for each name defined in it:
-        if name already in baseline → ERROR "duplicates the one already defined in <file>"
-        else → add to baseline
-run checks 4-6 over the full resulting baseline
-```
-This is why editing `orders.yml` to redefine `orders` is NOT flagged (baseline's `orders.yml`
-entries are dropped before the check), while a **different** file defining a cube also named
-`orders` IS flagged — the regression test for the bug this pipeline exists to catch
-(`semantic-service/src/test/java/.../ModelValidationServiceTest.java`,
-`duplicateAgainstBaselineIsRejected`).
+Implementation detail for **[HLD.md](./HLD.md)**: the Helm values and templates for
+`semantic-service` (database, StarRocks, SQL gateway), Superset's connection to the gateway, the
+ArgoCD `Application` spec, and how the chart is checked.
 
 ---
 
-## 2. Helm chart additions (`helm/data-platform/`)
+## 1. `semantic-service` (values.yaml)
 
-### 2.1 `services.cube` (values.yaml)
 ```yaml
-cube:
-  enabled: true
-  image:
-    repository: ghcr.io/tuanphanduy/cube-semantic
-    tag: ""                    # bumped by cube-semantic's CI to the git sha
-  port: 4000                   # REST + GraphQL + Playground
+semantic-service:
+  port: 8081
   extraPorts:
-    - { name: sql, port: 15432 }   # Cube SQL API — semantic-service's /sql-rewrite
-  autoscaling: { enabled: false }  # Cube dev-mode is single-instance
-  pdb: { enabled: false }
-  probes: { type: http, path: /readyz, initialDelaySeconds: 20 }
-  securityContext:
-    runAsNonRoot: false        # upstream cubejs/cube image has no non-root user (confirmed:
-                                # `docker run --entrypoint id cubejs/cube:latest` → uid=0)
-  envSecret:
-    CUBEJS_API_SECRET: CUBE_API_SECRET   # appSecret stores it under the OTHER services' key name
+    - { name: pgwire, port: 15432 }      # SQL gateway (Postgres wire) for BI tools
+  env:                                   # values pass through `tpl`, so they may use {{ .Release.Name }}
+    DB_URL: "jdbc:postgresql://semantic-db:5432/semantic"   # its OWN database (HLD D10)
+    DB_USER: "semantic"
+    SR_JDBC_URL: "jdbc:mysql://starrocks:9030/information_schema?useSSL=false&allowPublicKeyRetrieval=true&tinyInt1isBit=false"
+    SR_USER: "semantic_reader"
+    SQL_GATEWAY_PORT: "15432"
+  envSecret:                             # env name -> appSecret key
+    DB_PASSWORD: SEMANTIC_DB_PASSWORD
+    SR_PASSWORD: SR_PASSWORD
+    SQL_GATEWAY_READER_PASSWORD: SQL_GATEWAY_READER_PASSWORD
+  sqlGateway:
+    tlsSecret: ""                        # Secret with keystore.p12 + password; required for sqlExternal
+  sqlExternal:                           # LoadBalancer/NodePort for the pgwire port only (HLD D9)
+    enabled: false
+    type: LoadBalancer
+    annotations: {}
+    loadBalancerSourceRanges: []
+    nodePort: null
 ```
 
-### 2.2 Template changes this required
-- **`templates/deployment.yaml`**: `securityContext.runAsNonRoot` is now
-  `{{ dig "securityContext" "runAsNonRoot" true $svc }}` (was hardcoded `true`) — every other
-  service is unaffected (defaults to `true`), only `cube` overrides.
-- **`templates/deployment.yaml` + `templates/service.yaml`**: new optional `$svc.extraPorts`
-  (list of `{name, port}`) rendered as additional `containerPort`/Service `port` entries — every
-  other service leaves this unset (no-op `range` over nil).
-- **`templates/deployment.yaml`**: `env:` now merges plain `$svc.env` values with a new
-  `$svc.envSecret` map (`name → secretKeyRef.key`), since `envFrom.secretRef` alone can't rename
-  a Secret key to the env var name a specific image expects.
+- **Database.** `DB_URL`/`DB_USER`/`DB_PASSWORD` as per-service env win over the shared
+  ConfigMap's `DB_URL` (iam-service's). The user needs `CREATEDB`/`CREATEROLE` for the gateway's
+  per-tenant catalog databases (`semantic-service/docs/LLD.md` §3.7).
+- **StarRocks.** A read-only account limited to the schemas the model reads.
+- **TLS.** When `sqlGateway.tlsSecret` is set, the pod mounts it at `/etc/sql-gateway` and gets
+  `SQL_GATEWAY_TLS_KEYSTORE=/etc/sql-gateway/keystore.p12` and `SQL_GATEWAY_TLS_KEYSTORE_PASSWORD`
+  from the Secret's `password` key; every gateway login must then use TLS. Create it with
+  `kubectl create secret generic sql-gateway-tls --from-file=keystore.p12 --from-literal=password=…`
+  (a PKCS#12 from cert-manager's `keystores.pkcs12` works too).
+- **Secrets** (`appSecret.data`, or the pre-provisioned Secret in staging/prod):
+  `SEMANTIC_DB_PASSWORD`, `SR_PASSWORD`, `SQL_GATEWAY_READER_PASSWORD` (the read-only role the
+  service creates for its catalog databases), and `SUPERSET_SEMANTIC_SQL_PASSWORD` (§3).
 
-### 2.3 ConfigMap auto-rewrite (`templates/configmap.yaml`)
-Same pattern already used for `redisHost`/`iamDbUrl`: when `services.cube.enabled`,
-`semantic-service`'s `CUBE_API_URL`/`CUBE_SQL_URL` are rewritten to the in-cluster Service
-(`http://<release>-cube:<port>/cubejs-api/v1`, `jdbc:postgresql://<release>-cube:15432/cube`)
-instead of `config.cubeApiUrl`/`config.cubeSqlUrl` (which become pure external-Cube-Cloud
-fallbacks, used only when `services.cube.enabled: false` — see `values-prod.yaml`'s Cube Cloud
-example). Separately, `config.cubeDbType/cubeDbHost/cubeDbPort/cubeDbUser/cubeDbName` are new
-keys surfaced as `CUBEJS_DB_*` — Cube's OWN connection to StarRocks, read only by the `cube` pod.
+Overlays: `values-dev.yaml` points the database at the in-cluster Postgres
+(`jdbc:postgresql://{{ .Release.Name }}-postgresql:5432/semantic`, user and password of
+`infra.postgresql`, which is a superuser there), StarRocks at `host.docker.internal:9030`, and sets
+`SQL_GATEWAY_ALLOW_PLAINTEXT=true` (no TLS on a laptop); `values-staging.yaml` turns `sqlExternal`
+on with a TLS secret; `values-prod.yaml` sets managed endpoints and keeps `sqlExternal` off until a
+network policy for BI clients exists.
 
 ---
 
-## 3. ArgoCD `Application`s (`argocd/app-data-platform-{dev,staging,prod}.yaml`)
+## 2. Template changes
+
+| Template | Change |
+|---|---|
+| `configmap.yaml` | Drops `CUBE_*`/`CUBEJS_*`. |
+| `deployment.yaml` | `env` values go through `tpl`; when `$svc.sqlGateway.tlsSecret` is set, mounts it and adds the two keystore env vars. |
+| `sql-gateway-external.yaml` | Replaces `cube-sql-external.yaml`: a Service named `<release>-semantic-sql-external` selecting semantic-service pods, port 15432 → `pgwire`; rendered only when `services.semantic-service.sqlExternal.enabled`. |
+| `infra-postgres.yaml` | The init script always creates the `semantic` database (and `superset` when Superset is on), so the in-cluster Postgres serves semantic-service in dev. |
+| `superset-deployment.yaml` | Registers the gateway instead of Cube (§3). |
+| `NOTES.txt` | Prints the gateway endpoint instead of Cube's. |
+
+`services.cube`, `config.cube*`, `CUBE_API_SECRET` and `CUBE_SQL_PASSWORD` are removed.
+
+---
+
+## 3. Superset → SQL gateway
+
+`superset.semantic`:
+```yaml
+semantic:
+  registerConnection: true
+  connectionName: "Semantic layer"
+  username: "acme/superset"     # a gateway account of the tenant Superset serves
+```
+The init container runs, when `SUPERSET_SEMANTIC_SQL_PASSWORD` is present in the Secret (the
+`secretKeyRef` is optional):
+```
+superset set-database-uri --database_name "Semantic layer" \
+  --uri "postgresql+psycopg2://acme%2Fsuperset:$PASS@<release>-semantic-service:15432/semantic?sslmode=<require|disable>"
+```
+`sslmode=require` when `services.semantic-service.sqlGateway.tlsSecret` is set, else `disable`
+(only valid with `SQL_GATEWAY_ALLOW_PLAINTEXT=true`, i.e. dev). The `/` of the username is
+URL-encoded. Bootstrap order: deploy → publish a model → create the account
+(`POST /api/semantic/sql-credentials {"name":"superset"}`) → put its password in the Secret →
+restart the Superset pod.
+
+---
+
+## 4. ArgoCD `Application`s (`argocd/app-data-platform-{dev,staging,prod}.yaml`)
 
 One `Application` per SDLC stage, all watching this repo's `main` — the split is which values
-overlay each loads, not a different git ref (see README.md "Promoting a change through
-dev → staging → prod"):
+overlay each loads, not a different git ref:
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -131,97 +117,22 @@ spec:
     automated: { prune: true, selfHeal: true }
     syncOptions: [CreateNamespace=true]
 ```
-`prune: true` means resources removed from the chart (e.g. disabling a service) are deleted from
-the cluster, not just left orphaned. `selfHeal: true` means a manual `kubectl edit` on anything
-this Application owns gets reverted on the next reconcile — the git state always wins.
-
-`values-staging.yaml` deliberately leaves `services.cube` at `values.yaml`'s default
-(`enabled: true`, no tag override), so the `sync` job's tag bump in §4.2 below reaches the
-staging `Application` on the very next reconcile with zero extra wiring. `values-prod.yaml` pins
-`services.*.image.tag` explicitly and sets `services.cube.enabled: false` (Cube Cloud in that
-example) — promoting a change to prod is a separate, deliberate PR against that file, not an
-automatic consequence of the `sync` job.
+`prune: true` deletes what the chart no longer renders — syncing this change removes the Cube
+Deployment, its Services and `cube-sql-external`. `selfHeal: true` reverts manual drift.
+Staging floats on `values.yaml`'s tags; `values-prod.yaml` pins `services.*.image.tag`, so
+promoting to prod is a deliberate PR against that file.
 
 ---
 
-## 4. `cube-semantic/.github/workflows/model-ci.yml` — sequence diagrams
+## 5. Checking the chart
 
-### 4.1 `validate` job
-
-```mermaid
-sequenceDiagram
-  participant GH as GitHub Actions
-  participant SEM as ephemeral semantic-service<br/>(built from source, this run)
-  participant REDIS as ephemeral redis
-  participant DISK as base-ref checkout<br/>(cube/model, mounted read-only)
-
-  GH->>GH: git diff base...HEAD -- cube/model/**
-  GH->>GH: build {path, content}[] JSON payload
-  GH->>SEM: docker build + run (network: model-ci)
-  GH->>REDIS: docker run (same network)
-  SEM->>DISK: CUBE_MODEL_DIR=/model (mounted)
-  GH->>SEM: GET /actuator/health (poll until 200)
-  GH->>SEM: POST /api/model/validate {files}
-  SEM->>DISK: ModelFileService.readAllWithSource() (baseline)
-  SEM->>SEM: merge + check (see LLD §1)
-  SEM-->>GH: {valid, errors[]}
-  alt valid == false
-    GH->>GH: print errors, exit 1 (fails the check)
-  else valid == true
-    GH->>GH: job succeeds
-  end
-```
-
-### 4.2 `sync` job (needs: validate; push:main only)
-
-```mermaid
-sequenceDiagram
-  participant GH as GitHub Actions
-  participant GHCR as ghcr.io
-  participant INFRA as data-platform-infrastructure
-  participant ARGO as ArgoCD (in-cluster)
-  participant K8S as cube Deployment
-
-  GH->>GH: docker build cube/ (model baked in)
-  GH->>GHCR: push cube-semantic:<sha>, :latest
-  GH->>INFRA: checkout (token: INFRA_REPO_TOKEN)
-  GH->>INFRA: yq -i .services.cube.image.tag = <sha>
-  GH->>INFRA: git commit + push   %% CI's LAST action
-  Note over GH,ARGO: CI never talks to the cluster.
-  ARGO->>INFRA: poll / detect new commit
-  ARGO->>ARGO: compute diff vs live state
-  ARGO->>K8S: apply (automated sync)
-  K8S->>GHCR: pull cube-semantic:<sha>
-  K8S->>K8S: roll out new pod
-```
-
----
-
-## 5. Local verification performed while building this
-
-No staging cluster exists yet, so the loop above was proven against a real local `kind` cluster
-+ a real ArgoCD install (not just `helm template`/static lint) before anything was pushed:
+No CI runs for this repo yet; before pushing, render every overlay:
 
 ```bash
-kind create cluster --name data-platform
-kubectl create namespace argocd
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-kubectl -n argocd wait --for=condition=available --timeout=300s deploy/argocd-server
-
-# Images built locally and loaded directly into kind's nodes — no registry push needed for this.
-docker build -t cube-semantic:test cube/            # (from cube-semantic)
-kind load docker-image cube-semantic:test --name data-platform
-docker build -t semantic-service:test semantic-service/
-kind load docker-image semantic-service:test --name data-platform
-
-helm lint helm/data-platform -f helm/data-platform/values-dev.yaml
-kubectl apply -f argocd/app-data-platform.yaml
-kubectl get application data-platform -n argocd -w   # until Synced + Healthy
-
-kubectl -n data-platform port-forward svc/dp-cube 14000:4000 &
-curl -s http://localhost:14000/cubejs-api/v1/meta | jq '.cubes | length, map(.name) | group_by(.) | map(select(length>1))'
-# → 7 cubes, zero duplicate names — the original bug this pipeline exists to prevent, verified
-#   end-to-end from a real (if local) ArgoCD-managed rollout, not just the validation endpoint.
+for env in dev staging prod; do
+  helm lint helm/data-platform -f helm/data-platform/values-$env.yaml
+  helm template dp helm/data-platform -f helm/data-platform/values-$env.yaml > /tmp/dp-$env.yaml
+done
+grep -c -i cube /tmp/dp-*.yaml                                  # 0: nothing of Cube is rendered
+grep -A3 'name: pgwire' /tmp/dp-staging.yaml                     # container + Service ports
 ```
-See `HLD.md` §4 for what was explicitly deferred (no real GHCR push, no live GitHub Actions run)
-and why.

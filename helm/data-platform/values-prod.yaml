@@ -24,11 +24,6 @@ observability:
 
 config:
   springProfilesActive: "prod,json"
-  # This example targets Cube CLOUD (external) — hence services.cube.enabled: false below.
-  # For self-hosted Cube-in-this-cluster instead, drop these two and leave services.cube on;
-  # the chart auto-points semantic-service at the in-cluster Service either way.
-  cubeApiUrl: "https://your-deployment.cubecloud.dev/cubejs-api/v1"
-  cubeSqlUrl: "jdbc:postgresql://your-deployment.cubecloud.dev:5432/cube"
   redisHost: "redis.prod.internal"           # managed Redis / ElastiCache
   iamDbUrl: "jdbc:postgresql://iam-db.prod.internal:5432/iam"   # managed Postgres
   keycloakServerUrl: "https://sso.example.com"
@@ -71,6 +66,16 @@ services:
   semantic-service:
     image: { tag: "1.0.0" }
     autoscaling: { enabled: true, minReplicas: 3, maxReplicas: 10, targetCPUUtilizationPercentage: 70 }
+    env:
+      DB_URL: "jdbc:postgresql://semantic-db.prod.internal:5432/semantic"   # managed Postgres
+      DB_USER: "semantic"
+      SR_JDBC_URL: "jdbc:mysql://starrocks.prod.internal:9030/information_schema?useSSL=false&allowPublicKeyRetrieval=true&tinyInt1isBit=false"
+      SR_USER: "semantic_reader"
+      SQL_GATEWAY_PORT: "15432"
+    # TLS on; the external Service stays off until a network policy for BI clients exists
+    # (then set sqlExternal.enabled and loadBalancerSourceRanges).
+    sqlGateway:
+      tlsSecret: "semantic-sql-gateway-tls"
   chat-service:
     image: { tag: "1.0.0" }
     autoscaling: { enabled: true, minReplicas: 3, maxReplicas: 15, targetCPUUtilizationPercentage: 65 }
@@ -80,8 +85,8 @@ services:
   data-platform-ui:
     image: { tag: "1.0.0" }
     autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6 }
-  cube:
-    enabled: false   # this example targets Cube Cloud (external) — see config.cubeApiUrl above
-  # No pinned tag here on purpose: cube-semantic's model-ci.yml bumps
-  # services.cube.image.tag to the git SHA that introduced the last validated
-  # model change — ArgoCD syncing THAT commit is the actual deploy.
+
+# The pre-provisioned secret must also carry IAM_INTERNAL_TOKEN.
+networkPolicy:
+  iam:
+    enabled: true

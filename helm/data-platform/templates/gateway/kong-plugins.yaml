@@ -1,8 +1,8 @@
 {{- if eq .Values.gateway.provider "kong" }}
 {{- $rel := .Release.Name -}}
-{{- $iamPort := (index .Values.services "iam-service").port -}}
-{{- /* Authorization: call iam-service /api/v1/me, inject trusted identity headers.
-       Mirrors gateway/authz.lua; the iam URL is rendered for this release. */ -}}
+{{- /* Authorization hand-off: forward the verified token's sub as X-Idp-Sub; each
+       service's authz-client checks permissions with iam-service. Mirrors gateway/authz.lua.
+       Needs the jwt plugin (gateway.jwt), otherwise every request is rejected with 401. */ -}}
 apiVersion: configuration.konghq.com/v1
 kind: KongPlugin
 metadata:
@@ -13,46 +13,44 @@ plugin: post-function
 config:
   access:
     - |
-      local http = require "resty.http"
       local cjson = require "cjson.safe"
-      local TRUSTED = { "X-Tenant-Id", "X-User-Id", "X-Roles", "X-Permissions" }
-      for _, h in ipairs(TRUSTED) do
+
+      -- 1. Strip spoofable identity headers before anything downstream can see them.
+      local IDENTITY = { "X-Idp-Sub", "X-Tenant-Id", "X-User-Id", "X-Roles", "X-Permissions" }
+      for _, h in ipairs(IDENTITY) do
         kong.service.request.clear_header(h)
       end
-      local auth = kong.request.get_header("Authorization")
-      if not auth or auth == "" then
-        return kong.response.exit(401, { message = "missing bearer token" })
+
+      -- 2. The jwt plugin leaves the verified token here; without it there is no authenticated caller.
+      local token = kong.ctx.shared.authenticated_jwt_token
+      if not token then
+        return kong.response.exit(401, { message = "missing or invalid bearer token" })
       end
-      local IAM_ME_URL = "http://{{ $rel }}-iam-service:{{ $iamPort }}/api/v1/me"
-      local cache_key = "iam-authz:" .. ngx.md5(auth)
-      local function resolve()
-        local httpc = http.new()
-        httpc:set_timeout(2000)
-        local res, err = httpc:request_uri(IAM_ME_URL, {
-          method = "GET",
-          headers = { ["Authorization"] = auth, ["Accept"] = "application/json" },
-        })
-        if not res then return nil, "iam-service unreachable: " .. (err or "unknown") end
-        return { status = res.status, body = res.body }
+
+      -- 3. Read `sub` from the (already verified) payload; JWTs use unpadded base64url.
+      local function b64url_decode(s)
+        s = s:gsub("-", "+"):gsub("_", "/")
+        return ngx.decode_base64(s .. string.rep("=", (4 - #s % 4) % 4))
       end
-      local ctx, err = kong.cache:get(cache_key, { ttl = {{ .Values.gateway.authz.cacheTtlSeconds }}, neg_ttl = 15 }, resolve)
-      if not ctx then
-        kong.log.err("iam-authz: ", err)
-        return kong.response.exit(503, { message = "authorization service unavailable" })
+      local payload = token:match("^[^.]+%.([^.]+)%.")
+      local json = payload and b64url_decode(payload)
+      local claims = json and cjson.decode(json)
+      if not claims or type(claims.sub) ~= "string" or claims.sub == "" then
+        return kong.response.exit(401, { message = "token has no subject" })
       end
-      if ctx.status == 401 then
-        return kong.response.exit(401, { message = "invalid or expired token" })
-      elseif ctx.status ~= 200 then
-        return kong.response.exit(403, { message = "forbidden" })
-      end
-      local me = cjson.decode(ctx.body)
-      if not me or not me.tenantId then
-        return kong.response.exit(403, { message = "no tenant for caller" })
-      end
-      kong.service.request.set_header("X-Tenant-Id", me.tenantId)
-      kong.service.request.set_header("X-User-Id", me.subject or "")
-      kong.service.request.set_header("X-Roles", table.concat(me.roles or {}, ","))
-      kong.service.request.set_header("X-Permissions", table.concat(me.permissions or {}, ","))
+
+      kong.service.request.set_header("X-Idp-Sub", claims.sub)
+---
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: {{ $rel }}-api-unrouted
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+plugin: request-termination
+config:
+  status_code: 404
+  message: "No single service owns this path; call it as /svc/<service>/<path>"
 ---
 apiVersion: configuration.konghq.com/v1
 kind: KongPlugin

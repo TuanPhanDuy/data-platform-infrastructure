@@ -1,7 +1,7 @@
 {{- if .Values.superset.enabled }}
 {{- $rel := .Release.Name -}}
 {{- $sec := include "dp.secretName" . -}}
-{{- $cube := index .Values.services "cube" -}}
+{{- $sem := index .Values.services "semantic-service" -}}
 {{- /* Metadata DB: in-cluster Postgres (second database alongside iam-service's) when
        infra.postgresql.enabled, else the external URI in superset.metadataDbUrl — same
        switch config/configmap.yaml uses for iamDbUrl. */ -}}
@@ -11,10 +11,9 @@
 {{- $dbPassKey = "DB_PASSWORD" -}}
 {{- $dbUri = printf "postgresql+psycopg2://%s:$(SUPERSET_DB_PASS)@%s-postgresql:5432/%s" .Values.infra.postgresql.username $rel .Values.superset.metadataDb.database -}}
 {{- end -}}
-{{- /* Cube SQL API address: in-cluster Service when services.cube.enabled, else external —
-       same switch templates/configmap.yaml uses for semantic-service's CUBE_SQL_URL. */ -}}
-{{- $cubeSqlHost := "cube" -}}
-{{- if $cube.enabled }}{{ $cubeSqlHost = printf "%s-cube" $rel }}{{ end -}}
+{{- /* The SQL gateway inside the cluster; TLS whenever semantic-service has a keystore. */ -}}
+{{- $gatewayHost := printf "%s-semantic-service" $rel -}}
+{{- $sslmode := ternary "require" "disable" (ne (dig "sqlGateway" "tlsSecret" "" $sem) "") -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -47,7 +46,7 @@ spec:
           {{- /* The stock apache/superset image ships with NO Postgres driver at all (confirmed:
                  `import psycopg2` fails out of the box) — every step below that touches a
                  Postgres URL (db upgrade against SQLALCHEMY_DATABASE_URI, set-database-uri
-                 against Cube) needs it first. Installing at startup (vs. a custom image with it
+                 against the SQL gateway) needs it first. Installing at startup (vs. a custom image with it
                  baked in) keeps this chart working against the unmodified upstream image; the
                  tradeoff is ~10-20s of extra pod startup time pulling from PyPI. Target dir is a
                  shared emptyDir (see volumes below), not the image's own site-packages, because
@@ -69,10 +68,14 @@ spec:
                 --email "$ADMIN_EMAIL" \
                 --password "$ADMIN_PASSWORD" || true
               superset init
-              {{- if .Values.superset.cube.registerConnection }}
-              superset set-database-uri \
-                --database_name "$CUBE_CONNECTION_NAME" \
-                --uri "postgresql+psycopg2://$CUBE_SQL_USER:$CUBE_SQL_PASSWORD@{{ $cubeSqlHost }}:15432/cube" || true
+              {{- if .Values.superset.semantic.registerConnection }}
+              if [ -n "$SEMANTIC_SQL_PASSWORD" ]; then
+                superset set-database-uri \
+                  --database_name "$SEMANTIC_CONNECTION_NAME" \
+                  --uri "postgresql+psycopg2://$SEMANTIC_SQL_USER:$SEMANTIC_SQL_PASSWORD@{{ $gatewayHost }}:15432/semantic?sslmode={{ $sslmode }}" || true
+              else
+                echo "SUPERSET_SEMANTIC_SQL_PASSWORD is empty; skipping the semantic layer connection"
+              fi
               {{- end }}
           env:
             - name: PYTHONPATH
@@ -102,16 +105,17 @@ spec:
                 secretKeyRef:
                   name: {{ $sec }}
                   key: SUPERSET_ADMIN_PASSWORD
-            {{- if .Values.superset.cube.registerConnection }}
-            - name: CUBE_CONNECTION_NAME
-              value: {{ .Values.superset.cube.connectionName | quote }}
-            - name: CUBE_SQL_USER
-              value: {{ .Values.config.cubeSqlUser | quote }}
-            - name: CUBE_SQL_PASSWORD
+            {{- if .Values.superset.semantic.registerConnection }}
+            - name: SEMANTIC_CONNECTION_NAME
+              value: {{ .Values.superset.semantic.connectionName | quote }}
+            - name: SEMANTIC_SQL_USER
+              value: {{ .Values.superset.semantic.username | replace "/" "%2F" | quote }}
+            - name: SEMANTIC_SQL_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ $sec }}
-                  key: CUBE_SQL_PASSWORD
+                  key: SUPERSET_SEMANTIC_SQL_PASSWORD
+                  optional: true
             {{- end }}
           volumeMounts:
             - name: superset-config

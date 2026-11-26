@@ -1,9 +1,8 @@
 # Dev overlay: self-contained cluster for local testing (kind / minikube's docker
 # driver — both resolve host.docker.internal via Docker Desktop). In-cluster Redis +
-# Postgres are enabled; autoscaling floors are lowered to fit a laptop. Cube.dev runs
-# IN-cluster (services.cube, same as prod) with a locally built/kind-loaded image;
-# StarRocks + Keycloak stay external — run them via cube-semantic's
-# docker-compose and this file points config.cubeDb*/keycloak* at that host.
+# Postgres are enabled (the Postgres also hosts semantic-service's database); autoscaling
+# floors are lowered to fit a laptop. StarRocks + Keycloak stay external on the host, and this
+# file points semantic-service's SR_JDBC_URL and config.keycloak* at it.
 #
 # helm upgrade --install dp ./helm/data-platform -f values-dev.yaml
 
@@ -18,7 +17,6 @@ config:
   springProfilesActive: "dev,json"
   # Reach docker-compose services on the host from inside kind (Docker Desktop
   # resolves host.docker.internal for every container, kind nodes included).
-  cubeDbHost: "host.docker.internal"
   keycloakServerUrl: "http://host.docker.internal:8080"
   keycloakIssuerUri: "http://host.docker.internal:8080/realms/data-platform"
 
@@ -38,6 +36,20 @@ services:
     resources:
       requests: { cpu: 100m, memory: 384Mi }
       limits:   { cpu: 500m, memory: 768Mi }
+    # The in-cluster Postgres (its user is a superuser there, which the SQL gateway's catalog
+    # databases need) and a host-run StarRocks. No TLS on a laptop, so plaintext logins are allowed;
+    # reach the gateway with `kubectl port-forward svc/dp-semantic-service 15432:15432`.
+    env:
+      DB_URL: "jdbc:postgresql://{{ .Release.Name }}-postgresql:5432/semantic"
+      DB_USER: "iam"
+      SR_JDBC_URL: "jdbc:mysql://host.docker.internal:9030/information_schema?useSSL=false&allowPublicKeyRetrieval=true&tinyInt1isBit=false"
+      SR_USER: "root"
+      SQL_GATEWAY_PORT: "15432"
+      SQL_GATEWAY_ALLOW_PLAINTEXT: "true"
+    envSecret:
+      DB_PASSWORD: DB_PASSWORD
+      SR_PASSWORD: SR_PASSWORD
+      SQL_GATEWAY_READER_PASSWORD: SQL_GATEWAY_READER_PASSWORD
   chat-service:
     autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3 }
     resources:
@@ -51,20 +63,9 @@ services:
   data-platform-ui:
     autoscaling: { enabled: false }
     replicas: 1
-  cube:
-    image:
-      repository: cube-semantic     # built + `kind load docker-image`'d locally, no registry pull
-      pullPolicy: IfNotPresent
-    resources:
-      requests: { cpu: 100m, memory: 384Mi }
-      limits:   { cpu: 500m, memory: 768Mi }
-    # sqlExternal stays off here on purpose: kind doesn't expose NodePort/LoadBalancer to the
-    # host without extra cluster config. For local Power BI / an external Superset, use:
-    #   kubectl port-forward svc/dp-cube 15432:15432
 
-# Self-hosted Superset, pre-wired to the in-cluster Cube SQL API (see values.yaml's
-# `superset:` block for what "pre-wired" means). Reaches it via `kubectl port-forward
-# svc/dp-superset 8088:8088` — ingress stays off in dev, same reasoning as cube.sqlExternal above.
+# Self-hosted Superset, pre-wired to the SQL gateway (see values.yaml's `superset:` block).
+# Reach it via `kubectl port-forward svc/dp-superset 8088:8088` — ingress stays off in dev.
 superset:
   enabled: true
   resources:

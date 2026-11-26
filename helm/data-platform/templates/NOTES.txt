@@ -22,8 +22,8 @@ Check rollout:
 
 {{- if not (or .Values.infra.redis.enabled .Values.infra.postgresql.enabled) }}
 
-NOTE: in-cluster infra is OFF. Ensure config.redisHost / config.iamDbUrl / config.cube*
-point at reachable external services, and that appSecret holds the real credentials.
+NOTE: in-cluster infra is OFF. Ensure config.redisHost / config.iamDbUrl and semantic-service's
+DB_URL / SR_JDBC_URL point at reachable external services, and that the Secret holds the real credentials.
 {{- end }}
 
 {{- if .Values.superset.enabled }}
@@ -31,9 +31,13 @@ point at reachable external services, and that appSecret holds the real credenti
 Superset: {{ include "dp.resourceName" (dict "root" $ "name" "superset") }}:{{ .Values.superset.port }}
 {{- if .Values.superset.ingress.enabled }}  -> http://{{ .Values.superset.ingress.host }}/
 {{- else }}  (kubectl port-forward svc/{{ include "dp.resourceName" (dict "root" $ "name" "superset") }} 8088:8088){{- end }}
-  Cube is pre-registered as a database connection ("{{ .Values.superset.cube.connectionName }}") — see helm/README.md "BI tool connections".
+  The semantic layer connection ("{{ .Values.superset.semantic.connectionName }}") is registered once the
+  Secret holds SUPERSET_SEMANTIC_SQL_PASSWORD — see helm/README.md "BI tool connections".
 {{- end }}
-{{- if (index .Values.services "cube").sqlExternal.enabled }}
 
-Cube SQL API (Postgres wire, for Power BI / an external Superset): kubectl get svc {{ include "dp.resourceName" (dict "root" $ "name" "cube") }}-sql-external -w
+SQL gateway for BI tools (Postgres wire): {{ include "dp.resourceName" (dict "root" $ "name" "semantic-service") }}:15432
+{{- if (index .Values.services "semantic-service").sqlExternal.enabled }}
+  external: kubectl get svc {{ .Release.Name }}-semantic-sql-external -w
+{{- else }}
+  from your machine: kubectl port-forward svc/{{ include "dp.resourceName" (dict "root" $ "name" "semantic-service") }} 15432:15432
 {{- end }}

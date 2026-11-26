@@ -1,10 +1,7 @@
 # Staging overlay: external managed backing services (staging-tier Redis/Postgres/Keycloak),
-# same shape as values-prod.yaml but smaller and NOT pinned. Unlike values-prod.yaml, Cube.dev
-# stays IN-CLUSTER here (services.cube isn't overridden, so it keeps the values.yaml default of
-# enabled: true) — that's deliberate: cube-semantic's CI bumps services.cube.image.tag on
-# values.yaml directly (see docs/HLD.md), and this is the overlay that change reaches
-# automatically. Staging is the continuous-deploy proving ground a model change goes through
-# before someone deliberately pins values-prod.yaml's tags to promote it further.
+# same shape as values-prod.yaml but smaller and NOT pinned — the continuous-deploy proving ground
+# before someone deliberately pins values-prod.yaml's tags. The SQL gateway is exposed with TLS here
+# so BI tools can be tried against it.
 #
 # helm upgrade --install dp ./helm/data-platform -n data-platform-staging -f values-staging.yaml
 
@@ -32,9 +29,6 @@ config:
   iamDbUrl: "jdbc:postgresql://iam-db.staging.internal:5432/iam"   # managed Postgres, staging tier
   keycloakServerUrl: "https://sso-staging.example.com"
   keycloakIssuerUri: "https://sso-staging.example.com/realms/data-platform"
-  # cubeApiUrl/cubeSqlUrl/cubeDb* left at values.yaml's defaults: services.cube.enabled stays
-  # true, so the chart auto-rewrites semantic-service to the in-cluster cube Service anyway
-  # (see templates/configmap.yaml) and config.cubeDb* keeps pointing at StarRocks.
 
 # Do NOT ship secrets in git. Pre-create a Secret (sealed-secrets / external-secrets / vault).
 appSecret:
@@ -74,19 +68,24 @@ gateway:
 services:
   semantic-service:
     autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 4, targetCPUUtilizationPercentage: 70 }
+    env:
+      DB_URL: "jdbc:postgresql://semantic-db.staging.internal:5432/semantic"   # managed Postgres
+      DB_USER: "semantic"
+      SR_JDBC_URL: "jdbc:mysql://starrocks.staging.internal:9030/information_schema?useSSL=false&allowPublicKeyRetrieval=true&tinyInt1isBit=false"
+      SR_USER: "semantic_reader"
+      SQL_GATEWAY_PORT: "15432"
+    # Real cluster, so a LoadBalancer gets Power BI Desktop / Tableau a reachable IP; TLS required.
+    sqlGateway:
+      tlsSecret: "semantic-sql-gateway-tls"
+    sqlExternal:
+      enabled: true
+      type: LoadBalancer
   chat-service:
     autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 4, targetCPUUtilizationPercentage: 65 }
   iam-service:
     autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3 }
   data-platform-ui:
     autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 2 }
-  cube:
-    # image.tag: no override — tracks values.yaml's services.cube.image.tag directly (see
-    # header note). sqlExternal IS overridden: staging is a real cluster (unlike dev's kind),
-    # so a LoadBalancer actually gets Power BI Desktop / an external Superset a reachable IP.
-    sqlExternal:
-      enabled: true
-      type: LoadBalancer
 
 # Self-hosted Superset. infra.postgresql is off in this overlay (external infra everywhere),
 # so metadataDbUrl points at a real staging Postgres instead of values.yaml's in-cluster
@@ -101,3 +100,8 @@ superset:
         hosts:
           - superset-staging.example.com
   metadataDbUrl: "postgresql+psycopg2://superset:$(SUPERSET_DB_PASS)@superset-db.staging.internal:5432/superset"
+
+# The pre-provisioned secret must also carry IAM_INTERNAL_TOKEN.
+networkPolicy:
+  iam:
+    enabled: true

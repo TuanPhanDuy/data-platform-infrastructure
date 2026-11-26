@@ -23,21 +23,6 @@ serviceAccount:
 config:
   # "json" activates structured JSON logging (logback-spring.xml) for Loki.
   springProfilesActive: "prod,json"
-  # Cube.dev — semantic-service's upstream. Ignored (auto-rewritten to the in-cluster
-  # Service) when services.cube.enabled=true; only used when Cube is external (Cube
-  # Cloud, or cube-semantic's docker-compose during local dev).
-  cubeApiUrl: "http://cube:4000/cubejs-api/v1"
-  cubeSqlUrl: "jdbc:postgresql://cube:15432/cube"
-  cubeSqlUser: "cube"
-  # Cube.dev's OWN connection to StarRocks — only read by the `cube` pod itself
-  # (services.cube.enabled=true). StarRocks/Postgres are never bundled; point these
-  # at wherever StarRocks actually runs (cube-semantic's docker-compose in dev).
-  cubeDbType: "mysql"
-  cubeDbHost: "starrocks"
-  cubeDbPort: "9030"
-  cubeDbUser: "root"
-  cubeDbName: "information_schema"
-  cubeDevMode: "true"
   # Redis — overridden automatically when infra.redis.enabled=true.
   redisHost: "redis"
   redisPort: "6379"
@@ -49,17 +34,23 @@ config:
   keycloakIssuerUri: "http://keycloak:8080/realms/data-platform"
   keycloakRealm: "data-platform"
 
-# Secret consumed by the backend services (Cube API secret, SQL/DB passwords,
-# Keycloak admin secret). In prod set create=false and pre-provision a Secret
+# Secret consumed by the backend services (database and StarRocks passwords, the SQL
+# gateway's catalog reader password, Keycloak admin secret). In prod set create=false and pre-provision a Secret
 # named `name` out of band (sealed-secrets / external-secrets / vault).
 appSecret:
   create: true
   name: ""            # empty -> "<release>-secret"
   data:
-    CUBE_API_SECRET: "cube-secret-change-me-please-32bytes-min"
-    CUBE_SQL_PASSWORD: "cube-secret-change-me"
     DB_PASSWORD: "iam"
+    SEMANTIC_DB_PASSWORD: "semantic-db-change-me"
+    SR_PASSWORD: ""
+    SQL_GATEWAY_READER_PASSWORD: "semantic-bi-reader-change-me"
+    # A SQL gateway account's key for Superset's connection; empty until an admin creates the
+    # account after the first model publish (helm/README.md "BI tool connections").
+    SUPERSET_SEMANTIC_SQL_PASSWORD: ""
     KEYCLOAK_ADMIN_CLIENT_SECRET: "iam-service-secret"
+    # Shared by iam-service and every authz-client for the /internal subject lookup (X-Internal-Token).
+    IAM_INTERNAL_TOKEN: "iam-internal-token-change-me"
     SUPERSET_SECRET_KEY: "superset-secret-change-me-please-32bytes-min"
     SUPERSET_ADMIN_PASSWORD: "superset-admin-change-me"
     # Only read when infra.postgresql.enabled=false (superset.metadataDbUrl points external).
@@ -97,7 +88,34 @@ services:
     pdb:
       enabled: true
       minAvailable: 1
-    env: {}
+    # The SQL gateway for BI tools (Postgres wire protocol).
+    extraPorts:
+      - name: pgwire
+        port: 15432
+    # Its own database and StarRocks; env values go through `tpl`, so they may use
+    # {{ .Release.Name }}. These win over the shared ConfigMap's DB_URL, which is iam-service's.
+    env:
+      DB_URL: "jdbc:postgresql://semantic-db:5432/semantic"
+      DB_USER: "semantic"
+      SR_JDBC_URL: "jdbc:mysql://starrocks:9030/information_schema?useSSL=false&allowPublicKeyRetrieval=true&tinyInt1isBit=false"
+      SR_USER: "semantic_reader"
+      SQL_GATEWAY_PORT: "15432"
+    envSecret:
+      DB_PASSWORD: SEMANTIC_DB_PASSWORD
+      SR_PASSWORD: SR_PASSWORD
+      SQL_GATEWAY_READER_PASSWORD: SQL_GATEWAY_READER_PASSWORD
+    sqlGateway:
+      # Secret with `keystore.p12` and `password`; once set every gateway login must use TLS.
+      tlsSecret: ""
+    # Exposes only the SQL gateway port outside the cluster for BI tools (Power BI Desktop, an
+    # external Superset/Tableau, Supabase). Off by default: a credentialed Postgres-wire endpoint,
+    # opt in per environment, and only together with sqlGateway.tlsSecret.
+    sqlExternal:
+      enabled: false
+      type: LoadBalancer          # LoadBalancer | NodePort
+      annotations: {}
+      loadBalancerSourceRanges: []
+      nodePort: null               # only used when type: NodePort
 
   chat-service:
     enabled: true
@@ -183,64 +201,9 @@ services:
       minAvailable: 1
     env: {}
 
-  # The Cube.dev semantic layer itself. Image is built + pushed by cube-semantic's
-  # model-ci.yml with the YAML model baked in (immutable per-commit image, not a bind mount) —
-  # bumping .image.tag here IS the GitOps deploy; see docs/HLD.md. Single-instance (Cube dev-mode
-  # keeps its pre-aggregation cache in Cube Store, not locally, so this is safe but not
-  # horizontally scaled today). StarRocks/Postgres stay external (config.cubeDb*).
-  cube:
-    enabled: true
-    image:
-      repository: ghcr.io/tuanphanduy/cube-semantic
-      tag: ""                    # empty -> Chart.appVersion; CI bumps this to the git sha
-      pullPolicy: IfNotPresent
-    port: 4000                   # REST + GraphQL API + Playground
-    extraPorts:
-      - name: sql                # Cube SQL API (Postgres wire protocol) — semantic-service's /sql-rewrite
-        port: 15432
-    replicas: 1                  # used only when autoscaling.enabled=false
-    autoscaling:
-      enabled: false
-    resources:
-      requests: { cpu: 250m, memory: 512Mi }
-      limits:   { cpu: "1",  memory: 1Gi }
-    probes:
-      type: http
-      path: /readyz
-      initialDelaySeconds: 20
-    pdb:
-      enabled: false
-    # The upstream cubejs/cube image has no non-root user configured (runs as root, uid 0) —
-    # unlike our own services' images, which do. Confirmed via `docker inspect`/`docker run id`.
-    securityContext:
-      runAsNonRoot: false
-    # Cube.dev expects CUBEJS_API_SECRET; appSecret stores it as CUBE_API_SECRET (the name
-    # semantic-service's own config uses) — envFrom.secretRef can't rename keys, so map it here.
-    # Same reason CUBEJS_SQL_USER/PASSWORD are mapped below: Cube Core's SQL API is DISABLED
-    # BY DEFAULT and needs its own CUBEJS_PG_SQL_PORT/CUBEJS_SQL_USER/CUBEJS_SQL_PASSWORD env
-    # vars to turn on — config.cubeSqlUser/appSecret.CUBE_SQL_PASSWORD only tell *clients*
-    # (semantic-service, Superset, Power BI) what to authenticate with; without these three,
-    # nothing is actually listening on the `sql` port declared above.
-    envSecret:
-      CUBEJS_API_SECRET: CUBE_API_SECRET
-      CUBEJS_SQL_PASSWORD: CUBE_SQL_PASSWORD
-    env:
-      CUBEJS_PG_SQL_PORT: "15432"     # must match extraPorts[].port above
-      CUBEJS_SQL_USER: "cube"          # must match config.cubeSqlUser
-    # Expose the SQL API (port 15432) outside the cluster for external BI tools (Power BI
-    # Desktop, an external Superset) that can't reach the in-cluster ClusterIP Service. OFF by
-    # default — this is a credentialed Postgres-wire endpoint, opt in per environment. See
-    # values-staging.yaml for a LoadBalancer example; for local dev prefer
-    # `kubectl port-forward svc/<release>-cube 15432:15432` instead of turning this on.
-    sqlExternal:
-      enabled: false
-      type: LoadBalancer          # LoadBalancer | NodePort
-      annotations: {}
-      nodePort: null               # only used when type: NodePort
-
 # ---------------------------------------------------------------------------
-# Apache Superset — self-hosted BI tool, pre-wired to Cube's SQL API as a Postgres-compatible
-# data source (Cube exposes cubes as tables; see docs.cube.dev/.../sql-api). Not part of the
+# Apache Superset — self-hosted BI tool, pre-wired to semantic-service's SQL gateway as a
+# Postgres data source (cubes and views appear as tables). Not part of the
 # `services:` range above because it needs its own metadata database + first-boot admin/init
 # steps that don't fit that generic template. OFF by default; see values-dev.yaml /
 # values-staging.yaml for enabled examples. Power BI Desktop (a client app, nothing to deploy)
@@ -248,7 +211,7 @@ services:
 #
 # The stock apache/superset image ships with NO Postgres driver (confirmed empirically: `import
 # psycopg2` fails) — templates/superset-deployment.yaml installs psycopg2-binary into a shared
-# emptyDir at pod startup so both the metadata-DB connection and the Cube connection work
+# emptyDir at pod startup so both the metadata-DB connection and the gateway connection work
 # unmodified. Costs ~10-20s of extra startup latency pulling from PyPI; swap in a custom image
 # with the driver baked in (`FROM apache/superset:3.1.3` + `pip install psycopg2-binary`) for
 # production if that latency/PyPI dependency at boot isn't acceptable.
@@ -283,13 +246,13 @@ superset:
   # "$(SUPERSET_DB_PASS)" where the password goes — Kubernetes expands it from appSecret's
   # SUPERSET_DB_PASSWORD key at container start. Only used when infra.postgresql.enabled=false.
   metadataDbUrl: "postgresql+psycopg2://superset:$(SUPERSET_DB_PASS)@superset-db.internal:5432/superset"
-  cube:
-    # Pre-registers Cube's SQL API as a Superset database connection on first boot
-    # (`superset set-database-uri`), pointed at the same in-cluster/external cube address
-    # semantic-service's CUBE_SQL_URL uses (see templates/configmap.yaml). Set false to add
-    # the connection by hand instead (Data > Databases > + Database in the Superset UI).
+  semantic:
+    # Registers the SQL gateway as a Superset database connection on start (`superset
+    # set-database-uri`), once appSecret's SUPERSET_SEMANTIC_SQL_PASSWORD holds the key of the
+    # gateway account below. Set false to add the connection by hand (Data > Databases).
     registerConnection: true
-    connectionName: "Cube"
+    connectionName: "Semantic layer"
+    username: "acme/superset"
   ingress:
     enabled: false
     host: superset.data-platform.local
@@ -321,11 +284,9 @@ ingress:
 # ---------------------------------------------------------------------------
 # Optional in-cluster backing infra — DEV CONVENIENCE ONLY, not production
 # grade. Best practice: keep these OFF in prod and use managed Postgres,
-# managed Redis, Cube Cloud, and a Keycloak operator / managed IdP. StarRocks
-# (and Postgres, the system of record it federates) are intentionally NOT
-# bundled — run them via cube-semantic's docker-compose, or a dedicated
-# operator, and set config.cubeDb* to reach them. Cube.dev ITSELF is bundled
-# (services.cube above) since its model is what this repo's GitOps loop syncs.
+# managed Redis, and a Keycloak operator / managed IdP. StarRocks is
+# intentionally NOT bundled — run it with a dedicated operator (or a host
+# docker-compose in dev) and point semantic-service's SR_JDBC_URL at it.
 # ---------------------------------------------------------------------------
 infra:
   redis:
@@ -387,36 +348,73 @@ observability:
 
 # ---------------------------------------------------------------------------
 # API gateway. provider=kong fronts all services with Kong (via the Kong
-# Ingress Controller): JWT authentication at the edge + authorization delegated
-# to iam-service (GET /api/v1/me → trusted X-Tenant-Id/X-Roles/... headers).
+# Ingress Controller): JWT authentication at the edge, then the token's sub is
+# forwarded as X-Idp-Sub; each service's authz-client checks permissions with iam-service.
 # provider=nginx falls back to the plain nginx Ingress defined in ingress.yaml.
 #
 # Requires the Kong Ingress Controller installed separately (Helm: kong/ingress),
-# with the serverless-function sandbox allowed to require the authz Lua modules:
+# with the serverless-function sandbox allowed to require the Lua module it uses:
 #   proxy env:  untrusted_lua=sandbox
-#               untrusted_lua_sandbox_requires=resty.http,cjson.safe
+#               untrusted_lua_sandbox_requires=cjson.safe
 # ---------------------------------------------------------------------------
 gateway:
   provider: kong               # kong | nginx
   ingressClass: kong
   host: data-platform.local
   tls: []
-  # Native-path routing (the SPA calls services on their own paths — no rewrite).
+  # Every service is reachable as /svc/<prefix>/<native path> (the prefix is stripped). Native
+  # paths are routed too, but only those exactly one service serves: /api/v1/tables, /runs, /jobs
+  # and /datasources exist in two services each, so they are prefixed-only. Unclaimed /api paths
+  # get a 404. Routes of services this chart does not deploy are skipped.
   routes:
-    - service: semantic-service
-      paths: [/api/cubes, /api/model, /api/metrics]
-    - service: chat-service
-      paths: [/api/chat, /api/sql]
     - service: iam-service
-      paths: [/api/v1]
+      prefix: iam
+      paths: [/api/v1/auth, /api/v1/me, /api/v1/permissions, /api/v1/roles, /api/v1/tenants, /api/v1/users]
+    - service: semantic-service
+      prefix: semantic
+      paths: [/api/cubes, /api/model, /api/metrics, /api/glossary, /api/certifications, /api/semantic]
+    - service: chat-service
+      prefix: chat
+      paths: [/api/chat, /api/sql]
+    - service: query-service
+      prefix: query
+      paths: [/api/v1/queries, /api/v1/results, /api/v1/saved-queries]
+    - service: catalog-service
+      prefix: catalog
+      paths: [/api/v1/datasets, /api/v1/files, /api/v1/lineage, /api/v1/policies, /api/v1/policy,
+              /api/v1/starrocks, /api/v1/tags, /api/v1/workspaces, /api/v1/namespaces]
+    - service: ingestion-service
+      prefix: ingestion
+      paths: [/api/v1/lakehouse, /api/v1/source, /api/v1/target, /api/v1/cdc, /api/v1/flink,
+              /api/v1/seatunnel, /api/v1/schema-drift, /api/v1/metrics]
+    - service: stats-service
+      prefix: stats
+      paths: [/api/v1/categories, /api/v1/orders, /api/v1/products, /api/v1/throughput]
+    - service: search-service
+      prefix: search
+      paths: [/api/v1/search]
+    - service: audit-service
+      prefix: audit
+      paths: [/api/v1/audit-events]
+    - service: policy-service
+      prefix: policy
+      paths: []                  # its native paths are catalog-service's (policy was merged there)
   jwt:
     enabled: true
     # PEM public key of the Keycloak realm (RS256). Fetch the body from
     # GET {keycloak}/realms/{realm} .public_key and wrap in PEM headers.
-    # When empty, JWT edge-auth is skipped and iam-service alone enforces auth.
+    # When empty the jwt plugin is not rendered, and the subject hand-off rejects every API call (401).
     rsaPublicKey: ""
-  authz:
-    # iam-service endpoint the authz function calls is derived from the release.
-    cacheTtlSeconds: 30
   cors:
     origins: ["*"]
+
+# Who may reach iam-service: only this release's pods and the gateway. Its /internal subject
+# lookup is not routed by the gateway and is additionally guarded by IAM_INTERNAL_TOKEN.
+networkPolicy:
+  iam:
+    enabled: false
+    # Namespace of the Kong proxy (kubernetes.io/metadata.name), so routed /api/v1 calls still arrive.
+    gatewayNamespace: kong
+    # Extra peers, e.g. the Prometheus namespace when scraping iam-service:
+    #   - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+    extraFrom: []

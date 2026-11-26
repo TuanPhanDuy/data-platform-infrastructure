@@ -7,7 +7,38 @@
 {{- range .Values.gateway.routes }}
 {{- $route := . }}
 {{- $svc := index $.Values.services $route.service }}
-{{- if $svc.enabled }}
+{{- if and $svc $svc.enabled }}
+{{- $backend := include "dp.resourceName" (dict "root" $ "name" $route.service) }}
+{{- /* /svc/<prefix>/<native path>: always unambiguous; Kong strips the prefix. */}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $rel }}-gw-{{ $route.service }}-prefixed
+  labels:
+    {{- include "dp.commonLabels" $ | nindent 4 }}
+  annotations:
+    konghq.com/plugins: {{ join "," $authPlugins | quote }}
+    konghq.com/strip-path: "true"
+spec:
+  ingressClassName: {{ $.Values.gateway.ingressClass }}
+  {{- with $.Values.gateway.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ $.Values.gateway.host | quote }}
+      http:
+        paths:
+          - path: /svc/{{ $route.prefix }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $backend }}
+                port:
+                  number: {{ $svc.port }}
+{{- if $route.paths }}
+{{- /* Native paths only this service serves. */}}
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -33,11 +64,41 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {{ include "dp.resourceName" (dict "root" $ "name" $route.service) }}
+                name: {{ $backend }}
                 port:
                   number: {{ $svc.port }}
           {{- end }}
 {{- end }}
+{{- end }}
+{{- end }}
+{{- /* Unclaimed /api paths (e.g. /api/v1/tables, served by two services) get a 404, not the SPA. */}}
+{{- if (index .Values.services $ui).enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $rel }}-gw-api-unrouted
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+  annotations:
+    konghq.com/plugins: {{ printf "%s-api-unrouted,%s-cors" $rel $rel | quote }}
+spec:
+  ingressClassName: {{ .Values.gateway.ingressClass }}
+  {{- with .Values.gateway.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.gateway.host | quote }}
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "dp.resourceName" (dict "root" $ "name" $ui) }}
+                port:
+                  number: {{ (index .Values.services $ui).port }}
 {{- end }}
 {{- /* Public SPA — no auth, just CORS + correlation id. */ -}}
 {{- if (index .Values.services $ui).enabled }}

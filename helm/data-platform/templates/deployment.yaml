@@ -36,8 +36,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext:
-        # cubejs/cube's upstream image has no non-root user configured — override to false
-        # only for that service (services.cube.securityContext.runAsNonRoot: false).
+        # Overridable per service (securityContext.runAsNonRoot) for images without a non-root user.
         runAsNonRoot: {{ dig "securityContext" "runAsNonRoot" true $svc }}
         seccompProfile:
           type: RuntimeDefault
@@ -66,14 +65,15 @@ spec:
             - secretRef:
                 name: {{ include "dp.secretName" $ }}
                 optional: true
-          {{- if or $svc.env $svc.envSecret }}
+          {{- $tlsSecret := dig "sqlGateway" "tlsSecret" "" $svc }}
+          {{- if or $svc.env $svc.envSecret $tlsSecret }}
           env:
             {{- range $k, $v := $svc.env }}
             - name: {{ $k }}
-              value: {{ $v | quote }}
+              value: {{ tpl ($v | toString) $ | quote }}
             {{- end }}
-            {{- /* Secret-sourced env vars, e.g. renaming appSecret's CUBE_API_SECRET key to the
-                   CUBEJS_API_SECRET name Cube.dev itself expects — envFrom.secretRef can't rename keys. */}}
+            {{- /* Secret-sourced env vars under another name than their appSecret key, which
+                   envFrom.secretRef can't do. */}}
             {{- range $envName, $secretKey := $svc.envSecret }}
             - name: {{ $envName }}
               valueFrom:
@@ -81,6 +81,21 @@ spec:
                   name: {{ include "dp.secretName" $ }}
                   key: {{ $secretKey }}
             {{- end }}
+            {{- if $tlsSecret }}
+            - name: SQL_GATEWAY_TLS_KEYSTORE
+              value: /etc/sql-gateway/keystore.p12
+            - name: SQL_GATEWAY_TLS_KEYSTORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $tlsSecret }}
+                  key: password
+            {{- end }}
+          {{- end }}
+          {{- if $tlsSecret }}
+          volumeMounts:
+            - name: sql-gateway-tls
+              mountPath: /etc/sql-gateway
+              readOnly: true
           {{- end }}
           {{- if eq ($svc.probes.type | default "http") "http" }}
           livenessProbe:
@@ -117,5 +132,14 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+      {{- with (dig "sqlGateway" "tlsSecret" "" $svc) }}
+      volumes:
+        - name: sql-gateway-tls
+          secret:
+            secretName: {{ . }}
+            items:
+              - key: keystore.p12
+                path: keystore.p12
+      {{- end }}
 {{- end }}
 {{- end }}

@@ -1,7 +1,7 @@
 # Helm chart
 
-Container images + a Helm chart to run the data-platform application services (including
-Cube.dev itself) with horizontal autoscaling. This chart is what ArgoCD syncs — see
+Container images + a Helm chart to run the data-platform application services with horizontal
+autoscaling. This chart is what ArgoCD syncs — see
 [`../argocd/`](../argocd/) and [`../docs/HLD.md`](../docs/HLD.md) for how it gets there.
 
 ```
@@ -13,33 +13,31 @@ helm/
 
 | Service            | Port  | Probe                         | Autoscaling (default) |
 |---------------------|-------|--------------------------------|------------------------|
-| semantic-service    | 8081  | HTTP `/actuator/health`        | 2–6 pods, CPU 70%      |
+| semantic-service    | 8081 (+ 15432 SQL gateway) | HTTP `/actuator/health` | 2–6 pods, CPU 70% |
 | chat-service        | 8082  | HTTP `/actuator/health`        | 2–8 pods, CPU 65%      |
 | iam-service         | 8084  | HTTP `/actuator/health/{liveness,readiness}` | 2–6 pods, CPU 70% |
 | data-platform-ui    | 8080  | HTTP `/healthz` (nginx)        | 2–4 pods, CPU 80%      |
-| cube                | 4000 (+ 15432 SQL API) | HTTP `/readyz`  | disabled — Cube dev-mode is single-instance |
 
-Each service gets a Deployment, ClusterIP Service, and (except `cube`) a
-HorizontalPodAutoscaler + PodDisruptionBudget. A shared ConfigMap injects release-aware URLs
-(e.g. chat → semantic, semantic → cube, and Redis/Postgres hosts when in-cluster infra is on); a
-Secret holds credentials. Two Ingresses expose the UI at `/` and the APIs under `/api/*`
+Each service gets a Deployment, ClusterIP Service, HorizontalPodAutoscaler and
+PodDisruptionBudget. A shared ConfigMap injects release-aware URLs (e.g. chat → semantic, and
+Redis/Postgres hosts when in-cluster infra is on); a Secret holds credentials; per-service `env`/
+`envSecret` override them (semantic-service sets its own database and StarRocks this way). Two Ingresses expose the UI at `/` and the APIs under `/api/*`
 (prefix stripped before forwarding) — or Kong, via `gateway.provider: kong` (Kong config itself
 lives in the `data-platform` app-source checkout's `gateway/` folder, not in this repo).
 
-### `cube`: baked-in model, CI-driven tag
+### `semantic-service`: the semantic layer
 
-Unlike the other services, `cube`'s image isn't built by hand — `cube-semantic`'s
-`.github/workflows/model-ci.yml` bakes the validated Cube YAML model into an image and bumps
-`services.cube.image.tag` in this chart's `values.yaml` as its last step. **That commit is the
-deploy** — see [`../docs/HLD.md`](../docs/HLD.md) for the full loop. StarRocks/Postgres (what
-Cube queries) stay external either way — point `config.cubeDb*` at wherever StarRocks runs.
+It owns the semantic model in its own Postgres (edited and published through `/api/semantic/**`,
+not deployed from Git), runs every query on StarRocks, and serves BI tools on port 15432. Set its
+database and StarRocks under `services.semantic-service.env`/`envSecret`; see `docs/LLD.md` §1.
 
 ### Backing services (Postgres, Redis, StarRocks, Keycloak)
-External by default — best practice for stateful systems. Point `config.*` at managed offerings
-(managed Postgres, ElastiCache/managed Redis, a Keycloak operator or managed IdP). StarRocks (and
-the Postgres it federates from) is never bundled — run it via `cube-semantic`'s
-docker-compose, or a dedicated operator, and set `config.cubeDb*` to reach it. For local testing,
-`values-dev.yaml` turns on throwaway in-cluster Redis + Postgres for the *app* services.
+External by default — best practice for stateful systems. Point `config.*` and
+`services.semantic-service.env` at managed offerings (managed Postgres, managed Redis, a Keycloak
+operator or managed IdP). StarRocks is never bundled — run it with a dedicated operator (or a
+host docker-compose in dev) and set `SR_JDBC_URL` to reach it. For local testing,
+`values-dev.yaml` turns on throwaway in-cluster Redis + Postgres (which also hosts
+semantic-service's database).
 
 ## 1. Build & push images
 
@@ -52,18 +50,15 @@ docker build -t $REG/data-platform/data-platform-ui:1.0.0 \
   data-platform-ui
 docker push $REG/data-platform/...
 ```
-`cube`'s image is built by `cube-semantic`'s CI, not by hand — see above.
 
 ## 2. Deploy
 
-Local (kind, self-contained app-service infra; Cube in-cluster too, pointed at a host-run
-StarRocks — see `docs/LLD.md` for the exact commands used to prove this with a real kind cluster):
+Local (kind, self-contained app-service infra, pointed at a host-run StarRocks):
 ```bash
 helm upgrade --install dp ./helm/data-platform -f ./helm/data-platform/values-dev.yaml
 ```
 
-Staging (external infra, Cube stays in-cluster so `cube-semantic`'s CI-driven tag bump reaches
-it automatically — see `docs/HLD.md`):
+Staging (external infra, the SQL gateway exposed with TLS):
 ```bash
 kubectl create namespace data-platform-staging
 helm upgrade --install dp ./helm/data-platform -n data-platform-staging -f ./helm/data-platform/values-staging.yaml
@@ -103,53 +98,66 @@ ingress controller, then open `http://data-platform.local/`.
 By default (`gateway.provider: kong`) the chart fronts the services with **Kong** via the Kong
 Ingress Controller instead of the plain nginx Ingress. Set `gateway.provider: nginx` to fall back.
 
-## BI tool connections (Superset, Power BI)
+Kong validates the access token and forwards only its subject as `X-Idp-Sub`; each service checks
+permissions with iam-service. Every service is reachable as `/svc/<service>/<native path>`, and
+its native paths too where no other service shares them (`gateway.routes`; the table is in the
+app-source checkout's `gateway/README.md`), so build the UI with `VITE_<SERVICE>_API=/svc/<service>`.
+The sandbox needs only `untrusted_lua_sandbox_requires=cjson.safe`.
 
-Cube's SQL API speaks the Postgres wire protocol — any tool with a Postgres connector can query
-it, and cubes show up as tables (measures/dimensions as columns). Two prerequisites, both handled
-by this chart:
+`IAM_INTERNAL_TOKEN` in the app Secret guards iam-service's in-cluster `/internal` subject lookup:
+set a random value, including in the pre-provisioned staging/prod Secrets. `networkPolicy.iam`
+(on in staging and prod) lets only this release's pods and the Kong namespace
+(`networkPolicy.iam.gatewayNamespace`) reach iam-service; add a Prometheus namespace to
+`networkPolicy.iam.extraFrom` if it scrapes iam-service.
 
-1. **The SQL API must actually be enabled.** Cube Core has it off by default; `services.cube.env`
-   sets `CUBEJS_PG_SQL_PORT`/`CUBEJS_SQL_USER` and `envSecret` maps `CUBEJS_SQL_PASSWORD` from
-   `appSecret.data.CUBE_SQL_PASSWORD` (values.yaml). Credentials: user = `config.cubeSqlUser`
-   (default `cube`), password = that secret key, database = literal `cube` (Cube Core ignores the
-   db name — any string works, this chart's convention matches `config.cubeSqlUrl`).
-2. **Something outside the cluster needs to reach port 15432.** The chart's normal Service is
-   ClusterIP-only. `values-dev.yaml`: `kubectl port-forward svc/<release>-cube 15432:15432`.
-   `values-staging.yaml`: `services.cube.sqlExternal.enabled: true` (LoadBalancer) — get the
-   external IP with `kubectl get svc <release>-cube-sql-external -w`.
+## BI tool connections (Superset, Power BI, Tableau, Metabase, Supabase)
+
+semantic-service's SQL gateway speaks the Postgres wire protocol: any tool with a Postgres
+connector sees the tenant's cubes and views as tables (dimensions and measures as columns) and
+queries them with plain SQL. Three prerequisites:
+
+1. **A published model and a tenant account.** A tenant admin creates a service account:
+   ```bash
+   curl -s -X POST https://<host>/api/semantic/sql-credentials -H 'Content-Type: application/json' \
+     -H "Authorization: Bearer $TENANT_ADMIN_TOKEN" -d '{"name":"powerbi"}'   # needs semantic:manage
+   # → {"username":"acme/powerbi","password":"sk_…"}   shown once; revoke with DELETE …/{id}
+   ```
+2. **TLS.** Mount a PKCS#12 keystore with `services.semantic-service.sqlGateway.tlsSecret`
+   (`docs/LLD.md` §1); every login must then use TLS. Without one, only loopback clients can log in
+   unless `SQL_GATEWAY_ALLOW_PLAINTEXT=true` (dev).
+3. **A route to port 15432.** In-cluster it is `<release>-semantic-service:15432`. From outside:
+   `kubectl port-forward svc/<release>-semantic-service 15432:15432` (dev), or
+   `services.semantic-service.sqlExternal.enabled: true` (staging) and
+   `kubectl get svc <release>-semantic-sql-external -w` for the external IP.
 
 ### Superset (self-hosted, in-cluster)
 
-`superset.enabled: true` (already on in `values-dev.yaml`/`values-staging.yaml`) deploys Superset
-with its own metadata Postgres (a second database on `infra.postgresql`'s instance in dev, an
-external one via `superset.metadataDbUrl` in staging/prod) and, on first boot, an init container
-that runs `superset db upgrade`, creates the admin user (`superset.admin.*` +
-`appSecret.data.SUPERSET_ADMIN_PASSWORD`), and pre-registers Cube as a database connection
-(`superset set-database-uri`, named `superset.cube.connectionName`) — nothing to configure by
-hand. Reach the UI via `kubectl port-forward svc/<release>-superset 8088:8088` (dev) or
-`superset.ingress.host` (staging), log in with the admin credentials, and the "Cube" database is
-already there under Data > Databases — go straight to Data > Datasets to build one against a cube.
-
-Set `superset.cube.registerConnection: false` to skip the auto-registration and add the
-connection by hand instead (Data > Databases > + Database > PostgreSQL), using the same
-host/port/user/password/db as above (in-cluster host is `<release>-cube`, e.g. `dp-cube`).
+`superset.enabled: true` deploys Superset with its own metadata Postgres and, on start, an init
+container that runs `superset db upgrade`, creates the admin user, and registers the gateway as a
+database connection named `superset.semantic.connectionName` for the account
+`superset.semantic.username` — once that account's password is in the Secret under
+`SUPERSET_SEMANTIC_SQL_PASSWORD`. Order on a fresh cluster: deploy, publish a model, create the
+account (prerequisite 1 with `"name":"superset"`), store the password, restart the Superset pod.
+Then go to Data > Datasets and pick a cube or view.
 
 ### Power BI Desktop
 
-Power BI Desktop is a client app — there's nothing to deploy for it, it just needs network
-access to port 15432 (see prerequisite 2 above) and the native PostgreSQL connector:
-
 1. **Get Data > Database > PostgreSQL database.**
-2. **Server**: the port-forwarded/LoadBalancer host, e.g. `localhost:15432` or the external IP
-   from `kubectl get svc <release>-cube-sql-external`. **Database**: `cube`.
-3. Pick **Import** or **DirectQuery** (DirectQuery keeps queries live against Cube but means
-   re-syncing the semantic model manually as cubes change; Import is simpler to start with).
-4. Credentials: **Database** auth, user = `config.cubeSqlUser` (`cube`), password = the
-   `CUBE_SQL_PASSWORD` secret value (`kubectl get secret <release>-secret -o jsonpath='{.data.CUBE_SQL_PASSWORD}' | base64 -d`).
-   Cube's SQL API doesn't terminate TLS by default, so leave **Encrypt connection** off unless
-   you've put a TLS-terminating proxy in front of it.
-5. Your cubes appear as tables in the Navigator — measures and dimensions as columns.
+2. **Server**: the port-forwarded/LoadBalancer host and port, e.g. `localhost:15432`.
+   **Database**: any name (the account decides the tenant), e.g. `semantic`.
+3. **Import** or **DirectQuery**. Queries are translated to the semantic model, so a measure keeps
+   its own aggregation whatever Power BI wraps around it (ratios stay correct).
+4. Credentials: **Database** auth, user `acme/powerbi`, the password from prerequisite 1. Keep
+   **Encrypt connection** on (the gateway requires TLS once a keystore is configured).
+5. The cubes and views appear as tables in the Navigator.
+
+### Others
+
+Tableau, Metabase, DBeaver, Excel (psqlODBC) and psql use their PostgreSQL connector the same
+way. Supabase reads the model through `postgres_fdw`: `CREATE SERVER semantic FOREIGN DATA
+WRAPPER postgres_fdw OPTIONS (host '…', port '15432', dbname 'semantic', sslmode 'require')`, a
+user mapping with the account, then `IMPORT FOREIGN SCHEMA public FROM SERVER semantic INTO
+semantic`. What the gateway translates: `semantic-service/docs/LLD.md` §3.7.
 
 ## Observability
 

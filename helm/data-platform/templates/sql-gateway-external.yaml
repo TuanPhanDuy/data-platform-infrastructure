@@ -1,0 +1,32 @@
+{{- $sem := index .Values.services "semantic-service" -}}
+{{- if and $sem.enabled $sem.sqlExternal.enabled }}
+{{- /* Exposes only semantic-service's SQL gateway port outside the cluster for BI tools; the REST
+       port stays behind the ingress. Pair it with sqlGateway.tlsSecret (helm/README.md). */ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-semantic-sql-external
+  labels:
+    {{- include "dp.commonLabels" . | nindent 4 }}
+    {{- include "dp.selectorLabels" (dict "root" . "name" "semantic-service") | nindent 4 }}
+  {{- with $sem.sqlExternal.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $sem.sqlExternal.type }}
+  {{- with $sem.sqlExternal.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    {{- include "dp.selectorLabels" (dict "root" . "name" "semantic-service") | nindent 4 }}
+  ports:
+    - name: pgwire
+      port: 15432
+      targetPort: pgwire
+      protocol: TCP
+      {{- if and (eq $sem.sqlExternal.type "NodePort") $sem.sqlExternal.nodePort }}
+      nodePort: {{ $sem.sqlExternal.nodePort }}
+      {{- end }}
+{{- end }}
