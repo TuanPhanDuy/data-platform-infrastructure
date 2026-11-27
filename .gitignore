@@ -3,3 +3,5 @@
 
 # Local secrets (OPENROUTER_API_KEY for Jev)
 .env
+
+__pycache__/

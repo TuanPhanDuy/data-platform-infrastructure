@@ -13,7 +13,8 @@ description: >
 it. When Jev is uncertain, decide yourself and say so. Everything in `state` leaves the
 machine: ask before sending personal, customer or secret data. Never print or copy the API
 key; the script reads `OPENROUTER_API_KEY` from the environment, else from the first `.env`
-holding it in the working directory or any parent (it may sit outside the repo). Send a short
+holding it in the working directory or any parent (it may sit outside the repo); a `.env`
+that git tracks is skipped. Send a short
 description of the change, never code, secrets or customer data.
 
 The API is alpha: if a call fails unexpectedly, re-read
@@ -32,7 +33,7 @@ https://openrouter.ai/docs/guides/community/jev before guessing.
 ## Ask
 
 ```bash
-python3 .claude/skills/jev-decide/jev.py <<'EOF'
+python3 -B .claude/skills/jev-decide/jev.py <<'EOF'
 {
   "state": {"change": "...", "diff_summary": "..."},
   "questions": {
