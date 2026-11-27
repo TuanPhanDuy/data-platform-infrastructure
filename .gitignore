@@ -1,2 +1,5 @@
 .DS_Store
 *.log
+
+# Local secrets (OPENROUTER_API_KEY for Jev)
+.env
